@@ -18,11 +18,11 @@ type: log
 - 使用 gstack 工程评审视角审查 PRD、数据库设计和 MVP 实施计划。
 - 新增评审文档：`docs/logs/2026-05-15-gstack-plan-eng-review.md`。
 - 评审结论：方向正确，但进入 Claude Code 施工前必须先修订金额 cents 规范、normalize 幂等约束、人工覆盖机制、condition_json 规则表达、合成 CSV 测试夹具和 AGENTS.md 项目规则。
+- 根据 gstack finance checklist 修订 `docs/plans/mvp-implementation-plan-v0.1.md`：新增 Task 0、金额语义硬规则、CLI 脚本契约、fixtures 优先、测试要求和 Claude Code 交接口径。
+- 新增 `AGENTS.md`：固化隐私边界、金额 cents、幂等性、人工覆盖、规则分类、测试和 git 规则。
 
 ## 待办
 
-- 修订 `docs/plans/mvp-implementation-plan-v0.1.md`，把 gstack 评审发现的问题纳入实施顺序。
-- 写入 `AGENTS.md`，声明隐私、测试、金额单位和 Claude Code 施工规则。
 - 写入 `app/db/schema.sql`。
 - 写入 `app/db/seed_rules.sql`。
 - 创建合成 CSV fixtures。
