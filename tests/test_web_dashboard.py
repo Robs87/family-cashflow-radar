@@ -8,7 +8,13 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from app.main import DashboardHandler, _format_yuan, render_dashboard_html, run_refresh_pipeline
+from app.main import (
+    DashboardHandler,
+    _format_yuan,
+    render_dashboard_html,
+    run_refresh_pipeline,
+    save_manual_override,
+)
 from app.scripts.classify import classify
 from app.scripts.generate_monthly_cashflow import generate_monthly_cashflow
 from app.scripts.import_csv import import_csv
@@ -77,6 +83,8 @@ class TestRenderDashboard:
         assert "5,450.00 元" in html
         assert "近 12 月基础结余趋势" in html
         assert "unknown 待审核" in html
+        assert 'action="/actions/manual-override"' in html
+        assert "稳定收入" in html
 
     def test_renders_twelve_month_trend_limit(self, db_path):
         conn = sqlite3.connect(str(db_path))
@@ -134,6 +142,12 @@ class TestRenderDashboard:
         assert "导入 CSV" in html
         assert "imported=0 skipped_duplicate=35 failed=0" in html
 
+    def test_renders_manual_override_notice(self, db_with_dashboard_data):
+        html = render_dashboard_html(db_with_dashboard_data, notice={"ok": True, "message": "人工修正已保存"})
+
+        assert "人工修正已保存" in html
+        assert "notice-success" in html
+
 
 class TestRefreshPipeline:
     def test_refresh_pipeline_initializes_and_generates_dashboard_data(self, tmp_path):
@@ -165,6 +179,38 @@ class TestRefreshPipeline:
         assert len(result["steps"]) == 1
         assert result["steps"][0]["label"] == "导入 CSV"
         assert "输入路径不存在" in result["steps"][0]["stderr"]
+
+
+class TestManualOverride:
+    def test_save_manual_override_updates_transaction_and_regenerates_monthly(self, db_with_dashboard_data):
+        conn = sqlite3.connect(str(db_with_dashboard_data))
+        txn_id = conn.execute(
+            """SELECT id
+               FROM normalized_transactions
+               WHERE review_status = 'pending'
+               ORDER BY id
+               LIMIT 1"""
+        ).fetchone()[0]
+        conn.close()
+
+        result = save_manual_override(db_with_dashboard_data, txn_id, "fixed_expense", "outflow")
+
+        assert result == {"ok": True, "message": "人工修正已保存"}
+        conn = sqlite3.connect(str(db_with_dashboard_data))
+        row = conn.execute(
+            """SELECT manual_financial_type, manual_cashflow_direction, review_status
+               FROM normalized_transactions
+               WHERE id = ?""",
+            (txn_id,),
+        ).fetchone()
+        conn.close()
+        assert row == ("fixed_expense", "outflow", "approved")
+
+    def test_save_manual_override_rejects_invalid_type(self, db_with_dashboard_data):
+        result = save_manual_override(db_with_dashboard_data, 1, "bad_type", "outflow")
+
+        assert result["ok"] is False
+        assert "不支持的财务类型" in result["message"]
 
 
 class TestHttpHandler:
@@ -213,6 +259,61 @@ class TestHttpHandler:
         assert "刷新完成" in body
         assert "本月稳定收入" in body
         assert "20,000.00 元" in body
+
+    def test_post_manual_override(self, db_with_dashboard_data):
+        conn = sqlite3.connect(str(db_with_dashboard_data))
+        txn_id = conn.execute(
+            """SELECT id
+               FROM normalized_transactions
+               WHERE review_status = 'pending'
+               ORDER BY id
+               LIMIT 1"""
+        ).fetchone()[0]
+        conn.close()
+
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {"db_path": db_with_dashboard_data, "raw_input_path": FIXTURES_DIR},
+        )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            data = f"transaction_id={txn_id}&financial_type=fixed_expense&cashflow_direction=outflow".encode("utf-8")
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/actions/manual-override",
+                data=data,
+                method="POST",
+            )
+            request.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert response.status == 200
+        assert "人工修正已保存" in body
+        conn = sqlite3.connect(str(db_with_dashboard_data))
+        status = conn.execute(
+            "SELECT review_status FROM normalized_transactions WHERE id = ?",
+            (txn_id,),
+        ).fetchone()[0]
+        conn.close()
+        assert status == "approved"
+
+    def test_post_manual_override_rejects_bad_payload(self, dashboard_server):
+        request = urllib.request.Request(
+            dashboard_server + "/actions/manual-override",
+            data=b"transaction_id=bad&financial_type=fixed_expense&cashflow_direction=outflow",
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=5)
+        assert excinfo.value.code == 400
 
     def test_post_404_for_other_paths(self, dashboard_server):
         request = urllib.request.Request(dashboard_server + "/bad-action", data=b"", method="POST")

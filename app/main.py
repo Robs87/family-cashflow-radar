@@ -9,7 +9,7 @@ import sqlite3
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -24,6 +24,28 @@ DEFAULT_DB = Path("data/processed/cashflow.db")
 DEFAULT_RAW_INPUT = Path("data/raw")
 SCHEMA_SQL = Path(__file__).resolve().parent / "db" / "schema.sql"
 SEED_RULES_SQL = Path(__file__).resolve().parent / "db" / "seed_rules.sql"
+FINANCIAL_TYPE_OPTIONS = [
+    ("stable_income", "稳定收入"),
+    ("one_time_income", "一次性收入"),
+    ("living_expense", "日常生活支出"),
+    ("fixed_expense", "固定刚性支出"),
+    ("debt_payment", "债务还款"),
+    ("debt_inflow", "借入资金"),
+    ("asset_purchase", "资产购入"),
+    ("asset_sale", "资产出售"),
+    ("investment_outflow", "投资流出"),
+    ("investment_inflow", "投资流入"),
+    ("internal_transfer", "内部转账"),
+    ("credit_card_payment", "信用卡还款"),
+    ("refund", "退款"),
+    ("historical_debt_asset_event", "历史债务资产事件"),
+    ("unknown", "unknown"),
+]
+DIRECTION_OPTIONS = [
+    ("inflow", "流入"),
+    ("outflow", "流出"),
+    ("neutral", "中性"),
+]
 
 
 def _format_yuan(cents: int) -> str:
@@ -34,6 +56,10 @@ def _format_yuan(cents: int) -> str:
 
 def _month_label(row: sqlite3.Row) -> str:
     return f"{row['year']}-{row['month']:02d}"
+
+
+def _direction_label(value: str) -> str:
+    return dict(DIRECTION_OPTIONS).get(value, value or "")
 
 
 def _fetch_dashboard_data(db_path: Path) -> dict:
@@ -58,6 +84,22 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
                   SUM(CASE WHEN review_status = 'pending' THEN 1 ELSE 0 END) AS pending_count
                FROM normalized_transactions"""
         ).fetchone()
+        review_transactions = conn.execute(
+            """SELECT id,
+                      transaction_date,
+                      amount_cents,
+                      COALESCE(manual_cashflow_direction, cashflow_direction) AS effective_direction,
+                      COALESCE(manual_financial_type, financial_type) AS effective_financial_type,
+                      account,
+                      counterparty,
+                      description,
+                      review_status
+               FROM normalized_transactions
+               WHERE review_status = 'pending'
+                  OR COALESCE(manual_financial_type, financial_type) = 'unknown'
+               ORDER BY transaction_date DESC, id DESC
+               LIMIT 20"""
+        ).fetchall()
     finally:
         conn.close()
 
@@ -66,6 +108,7 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
         "trend": [dict(row) for row in reversed(trend)],
         "unknown_count": int((review["unknown_count"] if review else 0) or 0),
         "pending_count": int((review["pending_count"] if review else 0) or 0),
+        "review_transactions": [dict(row) for row in review_transactions],
     }
 
 
@@ -145,6 +188,43 @@ def run_refresh_pipeline(db_path: Path, input_path: Path = DEFAULT_RAW_INPUT) ->
     return {"ok": all(step["ok"] for step in started_steps), "steps": started_steps}
 
 
+def save_manual_override(
+    db_path: Path,
+    transaction_id: int,
+    financial_type: str,
+    cashflow_direction: str,
+) -> dict:
+    allowed_types = {value for value, _label in FINANCIAL_TYPE_OPTIONS}
+    allowed_directions = {value for value, _label in DIRECTION_OPTIONS}
+    if financial_type not in allowed_types:
+        return {"ok": False, "message": f"不支持的财务类型: {financial_type}"}
+    if cashflow_direction not in allowed_directions:
+        return {"ok": False, "message": f"不支持的现金流方向: {cashflow_direction}"}
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.execute(
+            """UPDATE normalized_transactions
+               SET manual_financial_type = ?,
+                   manual_cashflow_direction = ?,
+                   review_status = 'approved',
+                   manual_updated_at = CURRENT_TIMESTAMP,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (financial_type, cashflow_direction, transaction_id),
+        )
+        if cursor.rowcount == 0:
+            return {"ok": False, "message": f"未找到交易: {transaction_id}"}
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = _run_step("重新生成月度现金流", generate_monthly_cashflow, db_path)
+    if not result["ok"]:
+        return {"ok": False, "message": result["stderr"] or result["stdout"] or "月度现金流重新生成失败"}
+    return {"ok": True, "message": "人工修正已保存"}
+
+
 def _metric(label: str, value: str, tone: str = "neutral") -> str:
     return (
         f'<section class="metric metric-{tone}">'
@@ -201,7 +281,58 @@ def _render_pipeline_result(result: dict | None) -> str:
     )
 
 
-def render_dashboard_html(db_path: Path, pipeline_result: dict | None = None) -> str:
+def _render_notice(notice: dict | None) -> str:
+    if not notice:
+        return ""
+    tone = "success" if notice["ok"] else "failure"
+    return f'<section class="notice notice-{tone}">{html.escape(notice["message"])}</section>'
+
+
+def _render_options(options: list[tuple[str, str]], selected: str) -> str:
+    parts = []
+    for value, label in options:
+        selected_attr = " selected" if value == selected else ""
+        parts.append(f'<option value="{html.escape(value)}"{selected_attr}>{html.escape(label)}</option>')
+    return "".join(parts)
+
+
+def _render_review_transactions(rows: list[dict]) -> str:
+    if not rows:
+        return '<p class="empty">暂无待审核交易</p>'
+
+    rendered_rows = []
+    for row in rows:
+        title = " / ".join(
+            part
+            for part in (
+                str(row.get("account") or ""),
+                str(row.get("counterparty") or ""),
+                str(row.get("description") or ""),
+            )
+            if part
+        ) or "无描述"
+        rendered_rows.append(
+            '<form class="review-row" method="post" action="/actions/manual-override">'
+            f'<input type="hidden" name="transaction_id" value="{int(row["id"])}">'
+            '<div class="review-main">'
+            f'<strong>{html.escape(title)}</strong>'
+            f'<span>{html.escape(str(row["transaction_date"] or ""))} · '
+            f'{html.escape(_direction_label(row["effective_direction"]))} · '
+            f'{html.escape(_format_yuan(row["amount_cents"]))} 元</span>'
+            "</div>"
+            f'<select name="financial_type">{_render_options(FINANCIAL_TYPE_OPTIONS, row["effective_financial_type"])}</select>'
+            f'<select name="cashflow_direction">{_render_options(DIRECTION_OPTIONS, row["effective_direction"])}</select>'
+            '<button type="submit">保存</button>'
+            "</form>"
+        )
+    return "\n".join(rendered_rows)
+
+
+def render_dashboard_html(
+    db_path: Path,
+    pipeline_result: dict | None = None,
+    notice: dict | None = None,
+) -> str:
     data = _fetch_dashboard_data(db_path)
     latest = data["latest_month"]
 
@@ -228,6 +359,8 @@ def render_dashboard_html(db_path: Path, pipeline_result: dict | None = None) ->
     pending_count = data["pending_count"]
     trend_html = _render_trend_bars(data["trend"])
     pipeline_html = _render_pipeline_result(pipeline_result)
+    notice_html = _render_notice(notice)
+    review_transactions_html = _render_review_transactions(data["review_transactions"])
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -388,6 +521,42 @@ def render_dashboard_html(db_path: Path, pipeline_result: dict | None = None) ->
       font-variant-numeric: tabular-nums;
     }}
     .review-item.warn strong {{ color: var(--amber); }}
+    .review-transactions {{
+      display: grid;
+      gap: 8px;
+      margin-top: 14px;
+    }}
+    .review-row {{
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) 160px 120px 72px;
+      gap: 8px;
+      align-items: center;
+      padding: 10px 0;
+      border-top: 1px solid var(--line);
+    }}
+    .review-main {{
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }}
+    .review-main strong {{
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }}
+    .review-main span {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    select {{
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      color: var(--ink);
+      font: inherit;
+      padding: 0 8px;
+      width: 100%;
+    }}
     .empty {{
       color: var(--muted);
       margin: 0;
@@ -401,6 +570,16 @@ def render_dashboard_html(db_path: Path, pipeline_result: dict | None = None) ->
       padding: 16px 18px;
     }}
     .run-failure {{ border-left-color: var(--red); }}
+    .notice {{
+      margin-bottom: 14px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--green);
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 12px 14px;
+      font-weight: 700;
+    }}
+    .notice-failure {{ border-left-color: var(--red); }}
     .run-result h2 {{
       margin-bottom: 12px;
     }}
@@ -441,6 +620,7 @@ def render_dashboard_html(db_path: Path, pipeline_result: dict | None = None) ->
       .period {{ white-space: normal; }}
       .metrics, .grid {{ grid-template-columns: 1fr; }}
       .trend-row {{ grid-template-columns: 66px minmax(88px, 1fr) 96px; }}
+      .review-row {{ grid-template-columns: 1fr; }}
       .run-step {{ grid-template-columns: 1fr; }}
       .metric strong {{ font-size: 21px; }}
     }}
@@ -459,6 +639,7 @@ def render_dashboard_html(db_path: Path, pipeline_result: dict | None = None) ->
     </div>
   </header>
   <main class="wrap">
+    {notice_html}
     {pipeline_html}
     <section class="metrics">{metrics}</section>
     <section class="grid">
@@ -471,6 +652,9 @@ def render_dashboard_html(db_path: Path, pipeline_result: dict | None = None) ->
         <div class="review-list">
           <div class="review-item warn"><span>unknown 待审核</span><strong>{unknown_count}</strong></div>
           <div class="review-item"><span>pending 待审核</span><strong>{pending_count}</strong></div>
+        </div>
+        <div class="review-transactions">
+          {review_transactions_html}
         </div>
       </div>
     </section>
@@ -504,23 +688,47 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path != "/actions/refresh":
+        if parsed.path == "/actions/refresh":
+            result = run_refresh_pipeline(self.db_path, self.raw_input_path)
+            try:
+                body = render_dashboard_html(self.db_path, pipeline_result=result).encode("utf-8")
+                status = 200 if result["ok"] else 500
+            except sqlite3.Error as exc:
+                body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
+                status = 500
+        elif parsed.path == "/actions/manual-override":
+            notice = self._handle_manual_override()
+            try:
+                body = render_dashboard_html(self.db_path, notice=notice).encode("utf-8")
+                status = 200 if notice["ok"] else 400
+            except sqlite3.Error as exc:
+                body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
+                status = 500
+        else:
             self.send_error(404)
             return
-
-        result = run_refresh_pipeline(self.db_path, self.raw_input_path)
-        try:
-            body = render_dashboard_html(self.db_path, pipeline_result=result).encode("utf-8")
-            status = 200 if result["ok"] else 500
-        except sqlite3.Error as exc:
-            body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
-            status = 500
 
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _handle_manual_override(self) -> dict:
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        raw_body = self.rfile.read(content_length).decode("utf-8")
+        fields = parse_qs(raw_body)
+        try:
+            transaction_id = int(fields.get("transaction_id", [""])[0])
+        except ValueError:
+            return {"ok": False, "message": "交易 ID 无效"}
+
+        return save_manual_override(
+            self.db_path,
+            transaction_id,
+            fields.get("financial_type", [""])[0],
+            fields.get("cashflow_direction", [""])[0],
+        )
 
     def log_message(self, format: str, *args) -> None:
         return
