@@ -16,12 +16,14 @@ from pathlib import Path
 
 # Column aliases: normalized name -> list of possible CSV header names
 COLUMN_ALIASES = {
-    "transaction_time": ["时间", "交易时间", "日期时间", "交易日期时间", "date", "time", "datetime"],
+    "transaction_time": ["时间", "日期", "交易时间", "日期时间", "交易日期时间", "date", "time", "datetime"],
     "amount": ["金额", "交易金额", "amount", "value"],
-    "type": ["类型", "交易类型", "收支类型", "type", "direction"],
-    "account": ["账户", "交易账户", "account", "card"],
-    "category": ["分类", "类别", "category"],
-    "subcategory": ["子分类", "子类别", "subcategory", "sub_category"],
+    "income_amount": ["流入金额", "收入金额", "income_amount", "income"],
+    "expense_amount": ["流出金额", "支出金额", "expense_amount", "expense"],
+    "type": ["类型", "收支大类", "收支类型", "交易类型", "type", "direction"],
+    "account": ["账户", "交易账户", "资金账户", "account", "card"],
+    "category": ["分类", "类别", "收支大类", "category"],
+    "subcategory": ["子分类", "子类别", "交易分类", "subcategory", "sub_category"],
     "merchant": ["商户", "商家", "交易对手", "merchant", "payee", "counterparty"],
     "note": ["备注", "说明", "描述", "note", "memo", "description", "comment"],
     "project": ["项目", "project"],
@@ -85,8 +87,11 @@ def _read_csv_rows(file_path: Path, encoding: str):
         if headers and headers[0].startswith("\ufeff"):
             headers[0] = headers[0].lstrip("\ufeff")
         col_map = _build_column_mapping(headers)
-        required = ["transaction_time", "amount", "type"]
+        required = ["transaction_time", "type"]
         missing = [f for f in required if f not in col_map]
+        has_amount = "amount" in col_map or "income_amount" in col_map or "expense_amount" in col_map
+        if not has_amount:
+            missing.append("amount")
         if missing:
             raise ValueError(f"CSV 缺少必要列: {missing}，找到的列: {headers}")
         rows = []
@@ -97,6 +102,36 @@ def _read_csv_rows(file_path: Path, encoding: str):
             row["source_row_no"] = row_no_0
             rows.append(row)
         return rows
+
+
+def _amount_original(row: dict) -> tuple[str, str, str]:
+    income = row.get("income_amount", "").strip()
+    expense = row.get("expense_amount", "").strip()
+    amount = row.get("amount", "").strip()
+    type_raw = row.get("type", "").strip()
+
+    if amount:
+        if type_raw == "收入":
+            return amount, amount, ""
+        if type_raw == "支出":
+            return amount, "", amount
+        return amount, income, expense
+
+    if income and expense:
+        income_cents = _parse_amount_cents(income)
+        expense_cents = _parse_amount_cents(expense)
+        if income_cents > 0 and expense_cents == 0:
+            return income, income, expense
+        if expense_cents > 0 and income_cents == 0:
+            return expense, income, expense
+        if income_cents == 0 and expense_cents == 0:
+            return income, income, expense
+        return (income if income_cents >= expense_cents else expense), income, expense
+    if income:
+        return income, income, ""
+    if expense:
+        return expense, "", expense
+    raise ValueError("金额为空")
 
 
 def import_csv(db_path: Path, input_path: Path, dry_run: bool = False, verbose: bool = False) -> None:
@@ -137,16 +172,14 @@ def import_csv(db_path: Path, input_path: Path, dry_run: bool = False, verbose: 
             transaction_time = row.get("transaction_time", "")
 
             try:
-                amount_cents = _parse_amount_cents(row["amount"])
+                amount_original, income_amount_original, expense_amount_original = _amount_original(row)
+                amount_cents = _parse_amount_cents(amount_original)
             except ValueError as e:
                 print(f"错误: 文件 {source_file} 行 {source_row_no}: 金额解析失败: {e}", file=sys.stderr)
                 total_failed += 1
                 continue
 
-            amount_original = row["amount"]
             type_raw = row.get("type", "")
-            income_amount_original = amount_original if type_raw == "收入" else ""
-            expense_amount_original = amount_original if type_raw == "支出" else ""
 
             payload = {
                 "source_file": str(source_file),

@@ -196,6 +196,18 @@ class TestBuildColumnMapping:
         assert mapping["transaction_id"] == 0
         assert mapping["transaction_time"] == 1
 
+    def test_real_pixiu_export_headers(self):
+        headers = ["日期", "收支大类", "交易分类", "交易类型", "流入金额", "流出金额", "币种", "资金账户", "标签", "备注"]
+        mapping = _build_column_mapping(headers)
+        assert mapping["transaction_time"] == 0
+        assert mapping["type"] == 1
+        assert mapping["subcategory"] == 2
+        assert mapping["income_amount"] == 4
+        assert mapping["expense_amount"] == 5
+        assert mapping["account"] == 7
+        assert mapping["tags"] == 8
+        assert mapping["note"] == 9
+
 
 # ============================================================
 # single file import
@@ -213,6 +225,32 @@ class TestImportSingleFile:
     def test_import_2021_2022(self, db_path):
         import_csv(db_path, FIXTURES_DIR / "sample_pixiu_2021_2022.csv")
         assert _count_raw(db_path) == 12
+
+    def test_import_real_pixiu_export_shape(self, db_path, tmp_path):
+        csv_path = tmp_path / "real_pixiu_shape.csv"
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["日期", "收支大类", "交易分类", "交易类型", "流入金额", "流出金额", "币种", "资金账户", "标签", "备注"])
+            writer.writerow(["2026-05-01", "收入", "工资", "工资", "1000.00", "0.00", "CNY", "招商银行", "工资", "五月工资"])
+            writer.writerow(["2026-05-02", "支出", "餐饮", "外卖", "0.00", "88.50", "CNY", "微信", "生活", "午餐"])
+            writer.writerow(["2026-05-03", "", "转账", "转账", "500.00", "500.00", "CNY", "招商银行", "转账", "账户互转"])
+
+        import_csv(db_path, csv_path)
+
+        raw_rows = _fetch_raw(db_path)
+        assert len(raw_rows) == 3
+        assert raw_rows[0]["transaction_date"] == "2026-05-01"
+        assert raw_rows[0]["income_amount_original"] == "1000.00"
+        assert raw_rows[0]["expense_amount_original"] == "0.00"
+        assert raw_rows[0]["amount_cents"] == 100000
+        assert raw_rows[0]["account"] == "招商银行"
+        assert raw_rows[0]["subcategory_original"] == "工资"
+        assert raw_rows[1]["income_amount_original"] == "0.00"
+        assert raw_rows[1]["expense_amount_original"] == "88.50"
+        assert raw_rows[1]["amount_cents"] == 8850
+        assert raw_rows[2]["income_amount_original"] == "500.00"
+        assert raw_rows[2]["expense_amount_original"] == "500.00"
+        assert raw_rows[2]["amount_cents"] == 50000
 
 
 # ============================================================
