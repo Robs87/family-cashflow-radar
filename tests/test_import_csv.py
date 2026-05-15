@@ -136,6 +136,15 @@ class TestParseAmountCents:
     def test_small(self):
         assert _parse_amount_cents("200.50") == 20050
 
+    def test_decimal_0_29(self):
+        assert _parse_amount_cents("0.29") == 29
+
+    def test_decimal_0_58(self):
+        assert _parse_amount_cents("0.58") == 58
+
+    def test_large_decimal(self):
+        assert _parse_amount_cents("1234567890.12") == 123456789012
+
     def test_empty_raises(self):
         with pytest.raises(ValueError):
             _parse_amount_cents("")

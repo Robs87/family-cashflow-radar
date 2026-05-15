@@ -11,6 +11,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 # Column aliases: normalized name -> list of possible CSV header names
@@ -46,8 +47,11 @@ def _parse_amount_cents(amount_str: str) -> int:
     cleaned = amount_str.strip().replace(",", "").replace("，", "")
     if not cleaned:
         raise ValueError("金额为空")
-    amount = abs(float(cleaned))
-    return int(round(amount * 100))
+    try:
+        amount = abs(Decimal(cleaned))
+    except Exception:
+        raise ValueError(f"无效金额: {amount_str!r}")
+    return int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def _extract_date(time_str: str) -> str:
