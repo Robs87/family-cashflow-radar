@@ -333,6 +333,7 @@ def render_dashboard_html(
     pipeline_result: dict | None = None,
     notice: dict | None = None,
 ) -> str:
+    _ensure_database_initialized(db_path)
     data = _fetch_dashboard_data(db_path)
     latest = data["latest_month"]
 

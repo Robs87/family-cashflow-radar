@@ -109,6 +109,23 @@ class TestRenderDashboard:
         assert "暂无月度现金流数据" in html
         assert "unknown 待审核</span><strong>0</strong>" in html
 
+    def test_initializes_empty_database_before_rendering(self, tmp_path):
+        db_path = tmp_path / "fresh.db"
+
+        html = render_dashboard_html(db_path)
+
+        assert "暂无月度现金流数据" in html
+        conn = sqlite3.connect(str(db_path))
+        has_monthly = conn.execute(
+            """SELECT 1
+               FROM sqlite_master
+               WHERE type = 'table' AND name = 'monthly_cashflow'"""
+        ).fetchone()
+        rules_count = conn.execute("SELECT COUNT(*) FROM classification_rules").fetchone()[0]
+        conn.close()
+        assert has_monthly == (1,)
+        assert rules_count > 0
+
     def test_escapes_database_text(self, db_path):
         conn = sqlite3.connect(str(db_path))
         conn.execute(
