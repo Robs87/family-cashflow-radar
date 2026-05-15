@@ -2,14 +2,28 @@
 """Minimal local web dashboard for Family Cashflow Radar."""
 
 import argparse
+import contextlib
 import html
+import io
 import sqlite3
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.scripts.classify import classify
+from app.scripts.generate_monthly_cashflow import generate_monthly_cashflow
+from app.scripts.import_csv import import_csv
+from app.scripts.normalize import normalize
+
 
 DEFAULT_DB = Path("data/processed/cashflow.db")
+DEFAULT_RAW_INPUT = Path("data/raw")
+SCHEMA_SQL = Path(__file__).resolve().parent / "db" / "schema.sql"
+SEED_RULES_SQL = Path(__file__).resolve().parent / "db" / "seed_rules.sql"
 
 
 def _format_yuan(cents: int) -> str:
@@ -55,6 +69,82 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
     }
 
 
+def _ensure_database_initialized(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        has_raw_table = conn.execute(
+            """SELECT 1
+               FROM sqlite_master
+               WHERE type = 'table' AND name = 'raw_transactions'"""
+        ).fetchone()
+        if not has_raw_table:
+            conn.executescript(SCHEMA_SQL.read_text(encoding="utf-8"))
+
+        rules_count = conn.execute("SELECT COUNT(*) FROM classification_rules").fetchone()[0]
+        if rules_count == 0:
+            conn.executescript(SEED_RULES_SQL.read_text(encoding="utf-8"))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _run_step(label: str, func, *args) -> dict:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = 0
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            func(*args)
+        except SystemExit as exc:
+            exit_code = int(exc.code or 0)
+        except Exception as exc:
+            exit_code = 1
+            print(f"{type(exc).__name__}: {exc}", file=stderr)
+
+    return {
+        "label": label,
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "stdout": stdout.getvalue().strip(),
+        "stderr": stderr.getvalue().strip(),
+    }
+
+
+def run_refresh_pipeline(db_path: Path, input_path: Path = DEFAULT_RAW_INPUT) -> dict:
+    started_steps = []
+    try:
+        _ensure_database_initialized(db_path)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "steps": [
+                {
+                    "label": "初始化数据库",
+                    "ok": False,
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": f"{type(exc).__name__}: {exc}",
+                }
+            ],
+        }
+
+    steps = [
+        ("导入 CSV", import_csv, db_path, input_path),
+        ("标准化交易", normalize, db_path),
+        ("规则分类", classify, db_path),
+        ("生成月度现金流", generate_monthly_cashflow, db_path),
+    ]
+    for label, func, *args in steps:
+        result = _run_step(label, func, *args)
+        started_steps.append(result)
+        if not result["ok"]:
+            break
+
+    return {"ok": all(step["ok"] for step in started_steps), "steps": started_steps}
+
+
 def _metric(label: str, value: str, tone: str = "neutral") -> str:
     return (
         f'<section class="metric metric-{tone}">'
@@ -86,7 +176,32 @@ def _render_trend_bars(trend: list[dict]) -> str:
     return "\n".join(bars)
 
 
-def render_dashboard_html(db_path: Path) -> str:
+def _render_pipeline_result(result: dict | None) -> str:
+    if not result:
+        return ""
+
+    tone = "success" if result["ok"] else "failure"
+    title = "刷新完成" if result["ok"] else "刷新失败"
+    step_html = []
+    for step in result["steps"]:
+        status = "完成" if step["ok"] else "失败"
+        output = "\n".join(part for part in (step["stdout"], step["stderr"]) if part)
+        step_html.append(
+            '<li class="run-step">'
+            f'<span><strong>{html.escape(step["label"])}</strong><em>{html.escape(status)}</em></span>'
+            f'<code>{html.escape(output or "无输出")}</code>'
+            "</li>"
+        )
+
+    return (
+        f'<section class="run-result run-{tone}">'
+        f"<h2>{html.escape(title)}</h2>"
+        f'<ol>{"".join(step_html)}</ol>'
+        "</section>"
+    )
+
+
+def render_dashboard_html(db_path: Path, pipeline_result: dict | None = None) -> str:
     data = _fetch_dashboard_data(db_path)
     latest = data["latest_month"]
 
@@ -112,6 +227,7 @@ def render_dashboard_html(db_path: Path) -> str:
     unknown_count = data["unknown_count"]
     pending_count = data["pending_count"]
     trend_html = _render_trend_bars(data["trend"])
+    pipeline_html = _render_pipeline_result(pipeline_result)
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -166,6 +282,23 @@ def render_dashboard_html(db_path: Path) -> str:
       font-size: 14px;
       white-space: nowrap;
     }}
+    .actions {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }}
+    button {{
+      min-height: 38px;
+      border: 1px solid var(--green);
+      border-radius: 8px;
+      background: var(--green);
+      color: #ffffff;
+      font: inherit;
+      font-weight: 700;
+      padding: 0 14px;
+      cursor: pointer;
+    }}
+    button:active {{ transform: translateY(1px); }}
     main {{
       padding: 22px 0 36px;
     }}
@@ -259,11 +392,56 @@ def render_dashboard_html(db_path: Path) -> str:
       color: var(--muted);
       margin: 0;
     }}
+    .run-result {{
+      margin-bottom: 14px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--green);
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 16px 18px;
+    }}
+    .run-failure {{ border-left-color: var(--red); }}
+    .run-result h2 {{
+      margin-bottom: 12px;
+    }}
+    .run-result ol {{
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: grid;
+      gap: 8px;
+    }}
+    .run-step {{
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+    }}
+    .run-step span {{
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--ink);
+    }}
+    .run-step em {{
+      color: var(--muted);
+      font-style: normal;
+      font-size: 12px;
+      white-space: nowrap;
+    }}
+    .run-step code {{
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }}
     @media (max-width: 800px) {{
       .topbar {{ align-items: flex-start; flex-direction: column; }}
       .period {{ white-space: normal; }}
       .metrics, .grid {{ grid-template-columns: 1fr; }}
       .trend-row {{ grid-template-columns: 66px minmax(88px, 1fr) 96px; }}
+      .run-step {{ grid-template-columns: 1fr; }}
       .metric strong {{ font-size: 21px; }}
     }}
   </style>
@@ -272,10 +450,16 @@ def render_dashboard_html(db_path: Path) -> str:
   <header>
     <div class="wrap topbar">
       <h1>家庭现金流雷达</h1>
-      <div class="period">当前月份：{html.escape(month_label)}</div>
+      <div class="actions">
+        <form method="post" action="/actions/refresh">
+          <button type="submit">刷新数据</button>
+        </form>
+        <div class="period">当前月份：{html.escape(month_label)}</div>
+      </div>
     </div>
   </header>
   <main class="wrap">
+    {pipeline_html}
     <section class="metrics">{metrics}</section>
     <section class="grid">
       <div class="panel">
@@ -297,6 +481,7 @@ def render_dashboard_html(db_path: Path) -> str:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     db_path = DEFAULT_DB
+    raw_input_path = DEFAULT_RAW_INPUT
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -317,25 +502,48 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path != "/actions/refresh":
+            self.send_error(404)
+            return
+
+        result = run_refresh_pipeline(self.db_path, self.raw_input_path)
+        try:
+            body = render_dashboard_html(self.db_path, pipeline_result=result).encode("utf-8")
+            status = 200 if result["ok"] else 500
+        except sqlite3.Error as exc:
+            body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
+            status = 500
+
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format: str, *args) -> None:
         return
 
 
-def run_server(db_path: Path, host: str = "127.0.0.1", port: int = 8000) -> None:
+def run_server(db_path: Path, host: str = "127.0.0.1", port: int = 8000, input_path: Path = DEFAULT_RAW_INPUT) -> None:
     DashboardHandler.db_path = db_path
+    DashboardHandler.raw_input_path = input_path
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print(f"Using database: {db_path}")
+    print(f"Using CSV input: {input_path}")
     server.serve_forever()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="启动家庭现金流雷达 Web 仪表盘")
     parser.add_argument("--db", default=str(DEFAULT_DB), help="SQLite 数据库路径")
+    parser.add_argument("--input", default=str(DEFAULT_RAW_INPUT), help="CSV 文件或目录路径")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址")
     parser.add_argument("--port", type=int, default=8000, help="监听端口")
     args = parser.parse_args()
-    run_server(Path(args.db), host=args.host, port=args.port)
+    run_server(Path(args.db), host=args.host, port=args.port, input_path=Path(args.input))
 
 
 if __name__ == "__main__":

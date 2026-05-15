@@ -8,7 +8,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from app.main import DashboardHandler, _format_yuan, render_dashboard_html
+from app.main import DashboardHandler, _format_yuan, render_dashboard_html, run_refresh_pipeline
 from app.scripts.classify import classify
 from app.scripts.generate_monthly_cashflow import generate_monthly_cashflow
 from app.scripts.import_csv import import_csv
@@ -65,6 +65,8 @@ class TestRenderDashboard:
         html = render_dashboard_html(db_with_dashboard_data)
 
         assert "<title>家庭现金流雷达</title>" in html
+        assert 'action="/actions/refresh"' in html
+        assert "刷新数据" in html
         assert "本月稳定收入" in html
         assert "20,000.00 元" in html
         assert "本月刚性支出" in html
@@ -112,6 +114,58 @@ class TestRenderDashboard:
         html = render_dashboard_html(db_path)
         assert "<script>" not in html
 
+    def test_renders_pipeline_result(self, db_with_dashboard_data):
+        result = {
+            "ok": True,
+            "steps": [
+                {
+                    "label": "导入 CSV",
+                    "ok": True,
+                    "exit_code": 0,
+                    "stdout": "imported=0 skipped_duplicate=35 failed=0",
+                    "stderr": "",
+                }
+            ],
+        }
+
+        html = render_dashboard_html(db_with_dashboard_data, pipeline_result=result)
+
+        assert "刷新完成" in html
+        assert "导入 CSV" in html
+        assert "imported=0 skipped_duplicate=35 failed=0" in html
+
+
+class TestRefreshPipeline:
+    def test_refresh_pipeline_initializes_and_generates_dashboard_data(self, tmp_path):
+        db_path = tmp_path / "fresh.db"
+
+        result = run_refresh_pipeline(db_path, FIXTURES_DIR)
+
+        assert result["ok"] is True
+        assert [step["label"] for step in result["steps"]] == [
+            "导入 CSV",
+            "标准化交易",
+            "规则分类",
+            "生成月度现金流",
+        ]
+
+        conn = sqlite3.connect(str(db_path))
+        monthly_count = conn.execute("SELECT COUNT(*) FROM monthly_cashflow").fetchone()[0]
+        rules_count = conn.execute("SELECT COUNT(*) FROM classification_rules").fetchone()[0]
+        conn.close()
+        assert monthly_count == 3
+        assert rules_count > 0
+
+    def test_refresh_pipeline_stops_on_import_failure(self, db_path, tmp_path):
+        missing_input = tmp_path / "missing"
+
+        result = run_refresh_pipeline(db_path, missing_input)
+
+        assert result["ok"] is False
+        assert len(result["steps"]) == 1
+        assert result["steps"][0]["label"] == "导入 CSV"
+        assert "输入路径不存在" in result["steps"][0]["stderr"]
+
 
 class TestHttpHandler:
     def test_serves_index(self, dashboard_server):
@@ -130,4 +184,38 @@ class TestHttpHandler:
     def test_404_for_other_paths(self, dashboard_server):
         with pytest.raises(urllib.error.HTTPError) as excinfo:
             urllib.request.urlopen(dashboard_server + "/missing", timeout=5)
+        assert excinfo.value.code == 404
+
+    def test_post_refresh_runs_pipeline(self, db_path):
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {"db_path": db_path, "raw_input_path": FIXTURES_DIR},
+        )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/actions/refresh",
+                data=b"",
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert response.status == 200
+        assert "刷新完成" in body
+        assert "本月稳定收入" in body
+        assert "20,000.00 元" in body
+
+    def test_post_404_for_other_paths(self, dashboard_server):
+        request = urllib.request.Request(dashboard_server + "/bad-action", data=b"", method="POST")
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=5)
         assert excinfo.value.code == 404

@@ -23,6 +23,29 @@
 - 分类采用规则优先，AI 后置。
 - 先 CLI 跑通模型，再做 Web 仪表盘。
 
+## 日常使用
+
+把貔貅记账导出的 CSV 放进 `data/raw/`，然后启动本地仪表盘：
+
+```bash
+python3 app/main.py --db data/processed/cashflow.db --input data/raw
+```
+
+浏览器打开命令行显示的本地地址，点击页面右上角的“刷新数据”即可导入 CSV、标准化、分类并生成月度现金流。
+
+也可以继续使用 CLI 链路：
+
+```bash
+mkdir -p data/processed
+sqlite3 data/processed/cashflow.db < app/db/schema.sql
+sqlite3 data/processed/cashflow.db < app/db/seed_rules.sql
+python3 app/scripts/import_csv.py --db data/processed/cashflow.db --input data/raw
+python3 app/scripts/normalize.py --db data/processed/cashflow.db
+python3 app/scripts/classify.py --db data/processed/cashflow.db
+python3 app/scripts/generate_monthly_cashflow.py --db data/processed/cashflow.db
+python3 app/scripts/print_summary.py --db data/processed/cashflow.db
+```
+
 ## 目录
 
 - `docs/prd/`：产品需求文档。
