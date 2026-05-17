@@ -107,7 +107,10 @@ class TestRenderDashboard:
         assert "5,450.00 元" in html
         assert "近 12 月基础结余趋势" in html
         assert "unknown 待审核" in html
-        assert 'action="/actions/manual-override"' in html
+        assert 'id="review-panel"' in html
+        assert 'action="/actions/manual-override#review-panel"' in html
+        assert 'data-preserve-scroll="review"' in html
+        assert "family-cashflow-radar.reviewScrollY" in html
         assert "稳定收入" in html
 
     def test_renders_twelve_month_trend_limit(self, db_path):
@@ -158,11 +161,21 @@ class TestRenderDashboard:
                (year, month, stable_income_cents, net_operating_cashflow_cents)
                VALUES (2025, 1, 100000, 100000)"""
         )
+        conn.execute(
+            "INSERT INTO raw_transactions (source_file, source_row_no, amount_cents, raw_hash) VALUES ('x', 1, 10000, 'xss')"
+        )
+        conn.execute(
+            """INSERT INTO normalized_transactions
+               (raw_transaction_id, transaction_date, year, month, amount_cents,
+                cashflow_direction, financial_type, description)
+               VALUES (1, '2025-01-01', 2025, 1, 10000, 'outflow', 'unknown', '<script>alert(1)</script>')"""
+        )
         conn.commit()
         conn.close()
 
         html = render_dashboard_html(db_path)
-        assert "<script>" not in html
+        assert "<script>alert(1)</script>" not in html
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
 
     def test_renders_pipeline_result(self, db_with_dashboard_data):
         result = {

@@ -665,7 +665,7 @@ def _render_review_transactions(rows: list[dict]) -> str:
             if part
         ) or "无描述"
         rendered_rows.append(
-            '<form class="review-row" method="post" action="/actions/manual-override">'
+            '<form class="review-row" method="post" action="/actions/manual-override#review-panel" data-preserve-scroll="review">'
             f'<input type="hidden" name="transaction_id" value="{int(row["id"])}">'
             '<div class="review-main">'
             f'<strong>{html.escape(title)}</strong>'
@@ -1097,6 +1097,28 @@ def _render_financial_advice(data: dict) -> str:
     signal = _render_cashflow_signal(data)
     items = "".join(f"<li>{html.escape(item)}</li>" for item in _build_financial_advice(data))
     return f"{signal}<ul class=\"advice-list\">{items}</ul>"
+
+
+def _render_scroll_restore_script() -> str:
+    return """
+  <script>
+    (() => {
+      const key = "family-cashflow-radar.reviewScrollY";
+      const saved = sessionStorage.getItem(key);
+      if (saved !== null) {
+        sessionStorage.removeItem(key);
+        const y = Number(saved);
+        if (!Number.isNaN(y)) {
+          requestAnimationFrame(() => window.scrollTo(0, y));
+        }
+      }
+      for (const form of document.querySelectorAll('form[data-preserve-scroll="review"]')) {
+        form.addEventListener("submit", () => {
+          sessionStorage.setItem(key, String(window.scrollY));
+        });
+      }
+    })();
+  </script>"""
 
 
 def render_dashboard_html(
@@ -1710,7 +1732,7 @@ def render_dashboard_html(
           {expense_breakdown_html}
         </div>
       </div>
-      <div class="panel">
+      <div class="panel" id="review-panel">
         <h2>分类审核</h2>
         <div class="review-list">
           <div class="review-item warn"><span>unknown 待审核</span><strong>{unknown_count}</strong></div>
@@ -1742,6 +1764,7 @@ def render_dashboard_html(
       </div>
     </section>
     {prepayment_edit_html}
+    {_render_scroll_restore_script()}
   </main>
 </body>
 </html>"""
