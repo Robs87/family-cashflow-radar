@@ -999,6 +999,8 @@ def _build_financial_advice(data: dict) -> list[str]:
         advice.append("本月基础结余为负，优先检查固定支出、债务还款和高频生活支出，先暂停非必要大额消费。")
     elif net < stable_income * 0.1:
         advice.append("本月基础结余低于稳定收入的 10%，抗风险空间偏薄，建议给日常消费设一个周预算。")
+    elif fixed + debt > stable_income * 0.5:
+        advice.append("本月基础结余为正，但固定支出和债务还款压力偏高，提前还贷或新增大额支出前先做模拟。")
     else:
         advice.append("本月基础结余为正，现金流结构暂时健康；继续保持实时记录，月底再看是否稳定。")
 
@@ -1012,9 +1014,89 @@ def _build_financial_advice(data: dict) -> list[str]:
     return advice[:4]
 
 
+def _build_cashflow_signal(data: dict) -> dict[str, object]:
+    latest = data["latest_month"]
+    if not latest:
+        return {
+            "level": "watch",
+            "label": "观察状态",
+            "safety_months": None,
+            "headline": "当前家庭现金流：观察状态。先连续记录 7 天收入支出，再生成近期消费建议。",
+            "reason": "缺少月度现金流数据，系统还不能判断未来 30 天的大额支出风险。",
+        }
+
+    stable_income = int(latest["stable_income_cents"] or 0)
+    living = int(latest["living_expense_cents"] or 0)
+    fixed = int(latest["fixed_expense_cents"] or 0)
+    debt = int(latest["debt_payment_cents"] or 0)
+    net = int(latest["net_operating_cashflow_cents"] or 0)
+    unknown_count = int(data["unknown_count"] or 0)
+    pending_count = int(data["pending_count"] or 0)
+    required_outflow = fixed + debt
+    safety_months = round(net / required_outflow, 1) if required_outflow > 0 and net > 0 else 0.0
+
+    if stable_income <= 0 or net < 0:
+        level = "danger"
+        label = "危险状态"
+        action = "未来 30 天先暂停非必要大额消费，并优先补齐稳定收入、固定支出和债务记录。"
+    else:
+        net_ratio = net / stable_income
+        pressure_ratio = required_outflow / stable_income
+        living_ratio = living / stable_income
+        if net_ratio < 0.1 or pressure_ratio > 0.65:
+            level = "tight"
+            label = "偏紧状态"
+            action = "未来 30 天不建议新增大额支出，提前还贷和加仓投资都建议暂缓。"
+        elif net_ratio < 0.25 or pressure_ratio > 0.5 or living_ratio > 0.35:
+            level = "watch"
+            label = "观察状态"
+            action = "未来 30 天可以正常消费，但新增大额支出、提前还贷和加仓投资需要先做模拟。"
+        else:
+            level = "safe"
+            label = "安全状态"
+            action = "未来 30 天可维持正常消费；大额支出仍建议先确认不会把安全垫压到 1 个月以下。"
+
+    confidence_note = ""
+    if unknown_count or pending_count:
+        confidence_note = f" 当前仍有 {unknown_count} 笔 unknown、{pending_count} 笔 pending，建议可信度会下降。"
+
+    reason = (
+        f"本月基础结余 {_format_yuan(net)} 元，固定支出+债务还款 "
+        f"{_format_yuan(required_outflow)} 元，代理安全垫约 {safety_months:.1f} 个月。"
+        f"{confidence_note}"
+    )
+    return {
+        "level": level,
+        "label": label,
+        "safety_months": safety_months,
+        "headline": f"当前家庭现金流：{label}。{action}",
+        "reason": reason,
+    }
+
+
+def _render_cashflow_signal(data: dict) -> str:
+    signal = _build_cashflow_signal(data)
+    level = html.escape(str(signal["level"]))
+    headline = html.escape(str(signal["headline"]))
+    reason = html.escape(str(signal["reason"]))
+    safety = signal["safety_months"]
+    if safety is None:
+        safety_html = '<span class="signal-chip">安全垫：待计算</span>'
+    else:
+        safety_html = f'<span class="signal-chip">安全垫：{float(safety):.1f} 个月</span>'
+    return (
+        f'<div class="cashflow-signal signal-{level}">'
+        f"<strong>{headline}</strong>"
+        f"<p>{reason}</p>"
+        f"{safety_html}"
+        "</div>"
+    )
+
+
 def _render_financial_advice(data: dict) -> str:
+    signal = _render_cashflow_signal(data)
     items = "".join(f"<li>{html.escape(item)}</li>" for item in _build_financial_advice(data))
-    return f"<ul class=\"advice-list\">{items}</ul>"
+    return f"{signal}<ul class=\"advice-list\">{items}</ul>"
 
 
 def render_dashboard_html(
@@ -1328,6 +1410,39 @@ def render_dashboard_html(
       gap: 9px;
       color: var(--ink);
     }}
+    .cashflow-signal {{
+      display: grid;
+      gap: 8px;
+      margin-bottom: 14px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-left-width: 5px;
+      border-radius: 8px;
+      background: #ffffff;
+    }}
+    .cashflow-signal strong {{
+      font-size: 15px;
+      line-height: 1.45;
+    }}
+    .cashflow-signal p {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }}
+    .signal-chip {{
+      width: fit-content;
+      border-radius: 999px;
+      background: #f3f4f6;
+      color: var(--ink);
+      padding: 4px 9px;
+      font-size: 12px;
+      font-weight: 800;
+    }}
+    .signal-safe {{ border-left-color: #15945b; }}
+    .signal-watch {{ border-left-color: #c47a11; }}
+    .signal-tight {{ border-left-color: #d97706; }}
+    .signal-danger {{ border-left-color: #c2410c; }}
     .recent-list, .breakdown-list {{
       display: grid;
       gap: 10px;

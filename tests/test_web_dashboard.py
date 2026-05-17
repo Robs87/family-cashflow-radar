@@ -11,6 +11,7 @@ import pytest
 
 from app.main import (
     DashboardHandler,
+    _build_cashflow_signal,
     _format_yuan,
     render_dashboard_html,
     run_refresh_pipeline,
@@ -85,6 +86,9 @@ class TestRenderDashboard:
         assert "记录一笔收入或支出" in html
         assert 'action="/actions/add-transaction"' in html
         assert "财务建议" in html
+        assert "当前家庭现金流：" in html
+        assert "安全垫：" in html
+        assert "固定支出和债务还款压力偏高" in html
         assert "最近记录" in html
         assert "本月支出分析" in html
         assert "自动记账" in html
@@ -127,6 +131,7 @@ class TestRenderDashboard:
         html = render_dashboard_html(db_path)
         assert "暂无月份" in html
         assert "暂无月度现金流数据" in html
+        assert "当前家庭现金流：观察状态" in html
         assert "unknown 待审核</span><strong>0</strong>" in html
 
     def test_initializes_empty_database_before_rendering(self, tmp_path):
@@ -184,6 +189,42 @@ class TestRenderDashboard:
 
         assert "人工修正已保存" in html
         assert "notice-success" in html
+
+    def test_cashflow_signal_marks_negative_month_as_danger(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO monthly_cashflow
+               (year, month, stable_income_cents, fixed_expense_cents,
+                living_expense_cents, debt_payment_cents, net_operating_cashflow_cents)
+               VALUES (2026, 5, 1000000, 700000, 400000, 100000, -200000)"""
+        )
+        conn.commit()
+        conn.close()
+
+        html = render_dashboard_html(db_path)
+
+        assert "当前家庭现金流：危险状态" in html
+        assert "先暂停非必要大额消费" in html
+        assert "signal-danger" in html
+
+    def test_cashflow_signal_calculation_uses_required_outflow_buffer(self):
+        signal = _build_cashflow_signal(
+            {
+                "latest_month": {
+                    "stable_income_cents": 2_000_000,
+                    "living_expense_cents": 100_000,
+                    "fixed_expense_cents": 300_000,
+                    "debt_payment_cents": 200_000,
+                    "net_operating_cashflow_cents": 1_400_000,
+                },
+                "unknown_count": 0,
+                "pending_count": 0,
+            }
+        )
+
+        assert signal["level"] == "safe"
+        assert signal["label"] == "安全状态"
+        assert signal["safety_months"] == 2.8
 
 
 class TestRefreshPipeline:
