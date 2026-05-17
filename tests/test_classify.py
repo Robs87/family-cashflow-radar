@@ -222,6 +222,30 @@ class TestRuleClassification:
         assert row["financial_type"] == "unknown"
         assert row["review_status"] == "pending"
 
+    def test_reimbursable_and_reimbursement_are_not_living_or_income(self, db_path, tmp_path):
+        csv_path = tmp_path / "reimbursement.csv"
+        csv_path.write_text(
+            "时间,金额,类型,账户,分类,子分类,商户,备注\n"
+            "2025-04-01 10:00:00,3200.00,支出,招商银行,工作,垫付,航空公司,帮公司垫付机票\n"
+            "2025-04-05 10:00:00,3200.00,收入,招商银行,报销,报销到账,公司,公司报销到账\n",
+            encoding="utf-8",
+        )
+        import_csv(db_path, csv_path)
+        normalize(db_path)
+        classify(db_path)
+        rows = _fetch_normalized(db_path)
+
+        advance = _row_by_text(rows, "帮公司垫付机票")
+        assert advance["financial_type"] == "reimbursable_expense"
+        assert advance["cashflow_direction"] == "outflow"
+        assert advance["financial_type"] != "living_expense"
+
+        reimbursement = _row_by_text(rows, "公司报销到账")
+        assert reimbursement["financial_type"] == "reimbursement_income"
+        assert reimbursement["cashflow_direction"] == "inflow"
+        assert reimbursement["financial_type"] != "stable_income"
+        assert reimbursement["financial_type"] != "one_time_income"
+
 
 class TestManualOverride:
     def test_manual_financial_type_not_overwritten(self, db_with_edge_normalized):

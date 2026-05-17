@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS normalized_transactions (
         'stable_income', 'one_time_income', 'living_expense', 'fixed_expense',
         'debt_payment', 'debt_inflow', 'asset_purchase', 'asset_sale',
         'investment_outflow', 'investment_inflow', 'internal_transfer',
-        'credit_card_payment', 'refund', 'historical_debt_asset_event', 'unknown'
+        'credit_card_payment', 'refund', 'reimbursable_expense',
+        'reimbursement_income', 'historical_debt_asset_event', 'unknown'
     )),
     category_l1 TEXT,
     category_l2 TEXT,
@@ -72,7 +73,8 @@ CREATE TABLE IF NOT EXISTS normalized_transactions (
         'stable_income', 'one_time_income', 'living_expense', 'fixed_expense',
         'debt_payment', 'debt_inflow', 'asset_purchase', 'asset_sale',
         'investment_outflow', 'investment_inflow', 'internal_transfer',
-        'credit_card_payment', 'refund', 'historical_debt_asset_event', 'unknown'
+        'credit_card_payment', 'refund', 'reimbursable_expense',
+        'reimbursement_income', 'historical_debt_asset_event', 'unknown'
     )),
     manual_category_l1 TEXT,
     manual_category_l2 TEXT,
@@ -106,7 +108,8 @@ CREATE TABLE IF NOT EXISTS classification_rules (
         'stable_income', 'one_time_income', 'living_expense', 'fixed_expense',
         'debt_payment', 'debt_inflow', 'asset_purchase', 'asset_sale',
         'investment_outflow', 'investment_inflow', 'internal_transfer',
-        'credit_card_payment', 'refund', 'historical_debt_asset_event', 'unknown'
+        'credit_card_payment', 'refund', 'reimbursable_expense',
+        'reimbursement_income', 'historical_debt_asset_event', 'unknown'
     )),
     target_category_l1 TEXT,
     target_category_l2 TEXT,
@@ -142,6 +145,8 @@ CREATE TABLE IF NOT EXISTS monthly_cashflow (
     asset_purchase_cents INTEGER DEFAULT 0 CHECK(asset_purchase_cents >= 0),
     asset_sale_cents INTEGER DEFAULT 0 CHECK(asset_sale_cents >= 0),
     refund_cents INTEGER DEFAULT 0 CHECK(refund_cents >= 0),
+    reimbursable_expense_cents INTEGER DEFAULT 0 CHECK(reimbursable_expense_cents >= 0),
+    reimbursement_income_cents INTEGER DEFAULT 0 CHECK(reimbursement_income_cents >= 0),
     internal_transfer_cents INTEGER DEFAULT 0 CHECK(internal_transfer_cents >= 0),
     credit_card_payment_cents INTEGER DEFAULT 0 CHECK(credit_card_payment_cents >= 0),
     debt_inflow_cents INTEGER DEFAULT 0 CHECK(debt_inflow_cents >= 0),
@@ -231,3 +236,122 @@ CREATE TABLE IF NOT EXISTS decision_scenarios (
     explanation TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ============================================================
+-- 9. recurring_bill_templates: 周期性账单模板
+-- ============================================================
+CREATE TABLE IF NOT EXISTS recurring_bill_templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    bill_type TEXT NOT NULL CHECK(bill_type IN ('mortgage', 'fixed_bill')),
+    amount_cents INTEGER CHECK(amount_cents IS NULL OR amount_cents >= 0),
+    cashflow_direction TEXT NOT NULL CHECK(cashflow_direction IN ('inflow', 'outflow', 'neutral')),
+    financial_type TEXT NOT NULL CHECK(financial_type IN (
+        'stable_income', 'one_time_income', 'living_expense', 'fixed_expense',
+        'debt_payment', 'debt_inflow', 'asset_purchase', 'asset_sale',
+        'investment_outflow', 'investment_inflow', 'internal_transfer',
+        'credit_card_payment', 'refund', 'reimbursable_expense',
+        'reimbursement_income', 'historical_debt_asset_event', 'unknown'
+    )),
+    category_l1 TEXT,
+    category_l2 TEXT,
+    account TEXT,
+    start_date TEXT NOT NULL,
+    end_date TEXT,
+    schedule_type TEXT NOT NULL DEFAULT 'monthly' CHECK(schedule_type = 'monthly'),
+    day_of_month INTEGER NOT NULL CHECK(day_of_month BETWEEN 1 AND 31),
+    debt_id INTEGER,
+    enabled INTEGER DEFAULT 1,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(debt_id) REFERENCES debts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_recurring_templates_enabled
+    ON recurring_bill_templates(enabled, bill_type);
+
+-- ============================================================
+-- 10. mortgage_repayment_schedule: 房贷还款计划
+-- ============================================================
+CREATE TABLE IF NOT EXISTS mortgage_repayment_schedule (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recurring_template_id INTEGER NOT NULL,
+    debt_id INTEGER NOT NULL,
+    period_no INTEGER NOT NULL CHECK(period_no >= 1),
+    due_date TEXT NOT NULL,
+    payment_cents INTEGER NOT NULL CHECK(payment_cents >= 0),
+    principal_cents INTEGER NOT NULL CHECK(principal_cents >= 0),
+    interest_cents INTEGER NOT NULL CHECK(interest_cents >= 0),
+    fee_cents INTEGER NOT NULL DEFAULT 0 CHECK(fee_cents >= 0),
+    remaining_principal_cents INTEGER NOT NULL CHECK(remaining_principal_cents >= 0),
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(recurring_template_id, period_no),
+    UNIQUE(recurring_template_id, due_date),
+    FOREIGN KEY(recurring_template_id) REFERENCES recurring_bill_templates(id),
+    FOREIGN KEY(debt_id) REFERENCES debts(id),
+    CHECK(payment_cents = principal_cents + interest_cents + fee_cents)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mortgage_schedule_due_date
+    ON mortgage_repayment_schedule(due_date);
+
+-- ============================================================
+-- 11. recurring_bill_instances: 周期账单生成结果
+-- ============================================================
+CREATE TABLE IF NOT EXISTS recurring_bill_instances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recurring_template_id INTEGER NOT NULL,
+    due_date TEXT NOT NULL,
+    normalized_transaction_id INTEGER NOT NULL UNIQUE,
+    schedule_id INTEGER,
+    generated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(recurring_template_id, due_date),
+    FOREIGN KEY(recurring_template_id) REFERENCES recurring_bill_templates(id),
+    FOREIGN KEY(normalized_transaction_id) REFERENCES normalized_transactions(id),
+    FOREIGN KEY(schedule_id) REFERENCES mortgage_repayment_schedule(id)
+);
+
+-- ============================================================
+-- 12. debt_payment_splits: 债务还款本金/利息拆分
+-- ============================================================
+CREATE TABLE IF NOT EXISTS debt_payment_splits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    normalized_transaction_id INTEGER NOT NULL UNIQUE,
+    debt_id INTEGER,
+    principal_cents INTEGER NOT NULL CHECK(principal_cents >= 0),
+    interest_cents INTEGER NOT NULL CHECK(interest_cents >= 0),
+    fee_cents INTEGER NOT NULL DEFAULT 0 CHECK(fee_cents >= 0),
+    remaining_principal_cents INTEGER CHECK(remaining_principal_cents IS NULL OR remaining_principal_cents >= 0),
+    note TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(normalized_transaction_id) REFERENCES normalized_transactions(id),
+    FOREIGN KEY(debt_id) REFERENCES debts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_debt_payment_splits_debt
+    ON debt_payment_splits(debt_id);
+
+-- ============================================================
+-- 13. mortgage_prepayment_events: 房贷提前还款事件
+-- ============================================================
+CREATE TABLE IF NOT EXISTS mortgage_prepayment_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recurring_template_id INTEGER NOT NULL,
+    debt_id INTEGER NOT NULL,
+    prepayment_date TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+    effect_type TEXT NOT NULL CHECK(effect_type IN ('reduce_term', 'reduce_payment')),
+    remaining_principal_before_cents INTEGER NOT NULL CHECK(remaining_principal_before_cents >= 0),
+    remaining_principal_after_cents INTEGER NOT NULL CHECK(remaining_principal_after_cents >= 0),
+    generated_normalized_transaction_id INTEGER UNIQUE,
+    replaced_schedule_json TEXT,
+    note TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(recurring_template_id) REFERENCES recurring_bill_templates(id),
+    FOREIGN KEY(debt_id) REFERENCES debts(id),
+    FOREIGN KEY(generated_normalized_transaction_id) REFERENCES normalized_transactions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mortgage_prepayment_events_template_date
+    ON mortgage_prepayment_events(recurring_template_id, prepayment_date);

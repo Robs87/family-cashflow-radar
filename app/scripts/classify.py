@@ -12,6 +12,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from app.scripts.schema_migrations import ensure_v02_schema
+
 
 TEXT_FIELDS = ("category_l1", "category_l2", "account", "counterparty", "description")
 SUPPORTED_CONDITION_KEYS = {
@@ -149,6 +154,7 @@ def classify(db_path: Path, dry_run: bool = False, verbose: bool = False) -> Non
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
+    ensure_v02_schema(conn)
     cursor = conn.cursor()
 
     total_classified = 0

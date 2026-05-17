@@ -60,6 +60,9 @@ python3 app/scripts/print_summary.py --db data/processed/cashflow.db
 ## 当前文档
 
 - [PRD v0.1](docs/prd/prd-v0.1.md)
+- [PRD v0.2](docs/prd/prd-v0.2.md)
 - [数据库 Schema 与自动分类规则 v0.1](docs/design/database-schema-and-classification-rules-v0.1.md)
 - [MVP 实施计划 v0.1](docs/plans/mvp-implementation-plan-v0.1.md)
+- [v0.2 实施计划](docs/plans/v0.2-action-advice-plan.md)
+- [v0.2 更新摘要](docs/logs/2026-05-17-v0.2-update-summary.md)
 - [项目日志](docs/logs/project-log.md)

@@ -15,6 +15,11 @@ EXPECTED_TABLES = {
     "debts",
     "cashflow_forecast",
     "decision_scenarios",
+    "recurring_bill_templates",
+    "mortgage_repayment_schedule",
+    "recurring_bill_instances",
+    "debt_payment_splits",
+    "mortgage_prepayment_events",
 }
 
 
@@ -73,6 +78,20 @@ def test_debts_cents_fields_are_integer(db_conn):
     cols = _get_column_types(db_conn, "debts")
     for field in ["principal_initial_cents", "principal_current_cents", "monthly_payment_cents"]:
         assert cols.get(field) == "INTEGER", f"{field} should be INTEGER"
+
+
+def test_recurring_and_split_cents_fields_are_integer(db_conn):
+    for table in [
+        "recurring_bill_templates",
+        "mortgage_repayment_schedule",
+        "debt_payment_splits",
+        "mortgage_prepayment_events",
+    ]:
+        cols = _get_column_types(db_conn, table)
+        cents_fields = [field for field in cols if field.endswith("_cents")]
+        assert cents_fields
+        for field in cents_fields:
+            assert cols[field] == "INTEGER", f"{table}.{field} should be INTEGER"
 
 
 # --- UNIQUE constraints ---
@@ -181,6 +200,8 @@ REQUIRED_FINANCIAL_TYPES = [
     "stable_income",
     "one_time_income",
     "refund",
+    "reimbursable_expense",
+    "reimbursement_income",
     "fixed_expense",
     "living_expense",
     "unknown",
@@ -191,7 +212,7 @@ def test_seed_rules_importable(db_conn):
     """seed_rules.sql should execute without error."""
     db_conn.executescript(SEED_RULES_SQL.read_text(encoding="utf-8"))
     count = db_conn.execute("SELECT count(*) FROM classification_rules").fetchone()[0]
-    assert count >= 15, f"Expected >= 15 rules, got {count}"
+    assert count >= 17, f"Expected >= 17 rules, got {count}"
 
 
 def test_seed_rules_cover_required_types(db_conn_with_rules):

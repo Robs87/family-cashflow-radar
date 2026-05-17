@@ -4,6 +4,7 @@ import sqlite3
 import threading
 import urllib.error
 import urllib.request
+from urllib.parse import urlencode
 from http.server import ThreadingHTTPServer
 
 import pytest
@@ -13,7 +14,15 @@ from app.main import (
     _format_yuan,
     render_dashboard_html,
     run_refresh_pipeline,
+    run_recurring_generation,
+    save_fixed_bill_template,
     save_manual_override,
+    save_mortgage_template,
+    save_mortgage_prepayment,
+    save_new_transaction,
+    update_saved_fixed_bill_template,
+    update_saved_mortgage_template,
+    update_saved_mortgage_prepayment,
 )
 from app.scripts.classify import classify
 from app.scripts.generate_monthly_cashflow import generate_monthly_cashflow
@@ -73,6 +82,17 @@ class TestRenderDashboard:
         assert "<title>家庭现金流雷达</title>" in html
         assert 'action="/actions/refresh"' in html
         assert "刷新数据" in html
+        assert "记录一笔收入或支出" in html
+        assert 'action="/actions/add-transaction"' in html
+        assert "财务建议" in html
+        assert "最近记录" in html
+        assert "本月支出分析" in html
+        assert "自动记账" in html
+        assert 'action="/actions/add-mortgage-template"' in html
+        assert 'action="/actions/add-fixed-bill-template"' in html
+        assert 'action="/actions/update-mortgage-template"' not in html
+        assert "先创建房贷模板，再添加提前还款计划" in html
+        assert 'action="/actions/generate-recurring"' in html
         assert "本月稳定收入" in html
         assert "20,000.00 元" in html
         assert "本月刚性支出" in html
@@ -230,6 +250,137 @@ class TestManualOverride:
         assert "不支持的财务类型" in result["message"]
 
 
+class TestAddTransaction:
+    def test_save_new_transaction_records_and_regenerates_monthly(self, db_path):
+        result = save_new_transaction(
+            db_path,
+            "2026-05-16",
+            "68.00",
+            "outflow",
+            "living_expense",
+            "午饭 外卖",
+            category_l2="餐饮",
+        )
+
+        assert result == {"ok": True, "message": "新记录已保存"}
+        conn = sqlite3.connect(str(db_path))
+        normalized = conn.execute(
+            """SELECT amount_cents, cashflow_direction, financial_type, review_status, description
+               FROM normalized_transactions"""
+        ).fetchone()
+        monthly = conn.execute(
+            """SELECT living_expense_cents, net_operating_cashflow_cents
+               FROM monthly_cashflow
+               WHERE year = 2026 AND month = 5"""
+        ).fetchone()
+        conn.close()
+        assert normalized == (6800, "outflow", "living_expense", "approved", "午饭 外卖")
+        assert monthly == (6800, -6800)
+
+    def test_save_new_transaction_requires_description(self, db_path):
+        result = save_new_transaction(db_path, "2026-05-16", "68", "outflow", "living_expense", "")
+
+        assert result["ok"] is False
+        assert "说明" in result["message"]
+
+
+class TestRecurringWebActions:
+    def test_save_mortgage_template_renders_schedule(self, db_path):
+        result = save_mortgage_template(
+            db_path,
+            "房贷",
+            "10000",
+            "3.6",
+            "12",
+            "2026-01-15",
+            "15",
+        )
+
+        assert result["ok"] is True
+        html = render_dashboard_html(db_path)
+        assert "房贷还款计划" in html
+        assert "本金" in html
+        assert "利息" in html
+        assert 'action="/actions/add-mortgage-prepayment"' in html
+        assert 'href="/?edit_template=1#template-edit"' in html
+        assert 'action="/actions/update-mortgage-template"' not in html
+
+        edit_html = render_dashboard_html(db_path, edit_template_id=1)
+        assert 'action="/actions/update-mortgage-template"' in edit_html
+        assert "贷款金额" in edit_html
+
+    def test_update_saved_mortgage_template(self, db_path):
+        save_mortgage_template(db_path, "房贷", "10000", "3.6", "12", "2026-01-15", "15")
+
+        result = update_saved_mortgage_template(
+            db_path,
+            "1",
+            "房贷修正",
+            "20000",
+            "3.2",
+            "24",
+            "2026-02-20",
+            "20",
+        )
+
+        assert result == {"ok": True, "message": "房贷模板已更新，还款计划已重算"}
+        html = render_dashboard_html(db_path)
+        assert "房贷修正" in html
+        edit_html = render_dashboard_html(db_path, edit_template_id=1)
+        assert 'value="20000.00"' in edit_html
+
+    def test_save_mortgage_prepayment_recalculates_and_renders_event(self, db_path):
+        save_mortgage_template(db_path, "房贷", "10000", "3.6", "12", "2026-01-15", "15")
+
+        result = save_mortgage_prepayment(db_path, "1", "2026-04-01", "3000", "reduce_term")
+
+        assert result["ok"] is True
+        html = render_dashboard_html(db_path)
+        assert "提前还贷事件" in html
+        assert "缩短期限" in html
+        assert "3,000.00 元" in html
+        assert 'href="/?edit_prepayment=1#prepayment-edit"' in html
+
+        edit_html = render_dashboard_html(db_path, edit_prepayment_id=1)
+        assert 'action="/actions/update-mortgage-prepayment"' in edit_html
+
+    def test_update_saved_mortgage_prepayment(self, db_path):
+        save_mortgage_template(db_path, "房贷", "10000", "3.6", "12", "2026-01-15", "15")
+        save_mortgage_prepayment(db_path, "1", "2026-04-01", "3000", "reduce_term")
+
+        result = update_saved_mortgage_prepayment(db_path, "1", "2026-05-01", "2000", "reduce_payment")
+
+        assert result["ok"] is True
+        html = render_dashboard_html(db_path)
+        assert "降低月供" in html
+        assert "2,000.00 元" in html
+
+    def test_save_fixed_bill_template_and_generate(self, db_path):
+        result = save_fixed_bill_template(db_path, "电话费", "99", "2026-01-01", "1", "电话费")
+        assert result["ok"] is True
+
+        generation = run_recurring_generation(db_path, "2026-01-31")
+
+        assert generation["ok"] is True
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            """SELECT amount_cents, financial_type, category_l2
+               FROM normalized_transactions"""
+        ).fetchone()
+        conn.close()
+        assert row == (9900, "fixed_expense", "电话费")
+
+    def test_update_saved_fixed_bill_template(self, db_path):
+        save_fixed_bill_template(db_path, "宽带", "199", "2026-01-01", "1", "宽带")
+
+        result = update_saved_fixed_bill_template(db_path, "1", "电话费", "99", "2026-02-10", "10", "电话费")
+
+        assert result == {"ok": True, "message": "固定账单模板已更新"}
+        html = render_dashboard_html(db_path)
+        assert "电话费" in html
+        assert "99.00" in html
+
+
 class TestHttpHandler:
     def test_serves_index(self, dashboard_server):
         with urllib.request.urlopen(dashboard_server + "/", timeout=5) as response:
@@ -331,6 +482,50 @@ class TestHttpHandler:
         with pytest.raises(urllib.error.HTTPError) as excinfo:
             urllib.request.urlopen(request, timeout=5)
         assert excinfo.value.code == 400
+
+    def test_post_add_transaction(self, db_path):
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {"db_path": db_path, "raw_input_path": FIXTURES_DIR},
+        )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            data = urlencode(
+                {
+                    "transaction_date": "2026-05-16",
+                    "amount_yuan": "68",
+                    "cashflow_direction": "outflow",
+                    "financial_type": "living_expense",
+                    "description": "午饭 外卖",
+                    "category_l2": "餐饮",
+                }
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/actions/add-transaction",
+                data=data,
+                method="POST",
+            )
+            request.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert response.status == 200
+        assert "新记录已保存" in body
+        assert "午饭 外卖" in body
+        assert "68.00 元" in body
+
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute("SELECT COUNT(*) FROM normalized_transactions").fetchone()[0]
+        conn.close()
+        assert count == 1
 
     def test_post_404_for_other_paths(self, dashboard_server):
         request = urllib.request.Request(dashboard_server + "/bad-action", data=b"", method="POST")

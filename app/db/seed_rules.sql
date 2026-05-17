@@ -88,10 +88,36 @@ INSERT INTO classification_rules
      target_category_l1, target_category_l2, confidence, description)
 VALUES
     ('debt_inflow', 50,
-     '{"any_text_contains": ["借款", "借入", "借钱", "周转", "垫付", "亲友借款", "贷款到账"], "direction_in": ["收入", "in"]}',
+     '{"any_text_contains": ["借款", "借入", "借钱", "周转", "亲友借款", "贷款到账"], "direction_in": ["收入", "in"]}',
      'inflow', 'debt_inflow',
      '债务', '借入资金', 0.85,
      '借入资金流入，不算真实收入');
+
+-- ============================================================
+-- Priority 55: 工作垫付
+-- ============================================================
+INSERT INTO classification_rules
+    (rule_name, priority, condition_json, target_cashflow_direction, target_financial_type,
+     target_category_l1, target_category_l2, confidence, description)
+VALUES
+    ('reimbursable_expense', 55,
+     '{"any_text_contains": ["工作垫付", "公司垫付", "帮公司垫付", "代垫", "出差垫付", "垫付报销"], "direction_in": ["支出", "out"]}',
+     'outflow', 'reimbursable_expense',
+     '垫付报销', '工作垫付', 0.9,
+     '工作垫付临时占用现金，不算家庭生活支出');
+
+-- ============================================================
+-- Priority 56: 报销回款
+-- ============================================================
+INSERT INTO classification_rules
+    (rule_name, priority, condition_json, target_cashflow_direction, target_financial_type,
+     target_category_l1, target_category_l2, confidence, description)
+VALUES
+    ('reimbursement_income', 56,
+     '{"any_text_contains": ["报销到账", "公司报销", "报销款", "报销入账", "垫付报销"], "direction_in": ["收入", "in"]}',
+     'inflow', 'reimbursement_income',
+     '垫付报销', '报销回款', 0.9,
+     '工作垫付回款，不算稳定收入');
 
 -- ============================================================
 -- Priority 60: 投资流出
@@ -166,10 +192,10 @@ INSERT INTO classification_rules
      target_category_l1, confidence, description)
 VALUES
     ('one_time_income', 90,
-     '{"any_text_contains": ["奖金", "年终奖", "报销", "补贴", "红包", "礼金", "临时收入"]}',
+     '{"any_text_contains": ["奖金", "年终奖", "补贴", "红包", "礼金", "临时收入"]}',
      'inflow', 'one_time_income',
      '收入', 0.85,
-     '一次性收入（奖金、报销、红包等）');
+     '一次性收入（奖金、补贴、红包等）');
 
 -- ============================================================
 -- Priority 95: 退款

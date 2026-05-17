@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from app.scripts.classify import classify
+from app.scripts.add_transaction import add_manual_transaction
 from app.scripts.generate_monthly_cashflow import generate_monthly_cashflow
 from app.scripts.import_csv import import_csv
 from app.scripts.normalize import normalize
@@ -123,6 +124,22 @@ class TestMonthlyAggregation:
         row = _fetch_one_month(db_with_edge_classified, 2025, 3)
         assert row["refund_cents"] > 0
         assert row["total_real_income_cents"] == row["stable_income_cents"] + row["one_time_income_cents"]
+
+    def test_reimbursements_affect_total_but_not_operating_cashflow(self, db_path):
+        add_manual_transaction(db_path, "2026-05-16", 20_00000, "inflow", "stable_income", "工资")
+        add_manual_transaction(db_path, "2026-05-16", 320000, "outflow", "reimbursable_expense", "帮公司垫付机票")
+        add_manual_transaction(db_path, "2026-05-20", 320000, "inflow", "reimbursement_income", "公司报销到账")
+
+        generate_monthly_cashflow(db_path)
+        row = _fetch_one_month(db_path, 2026, 5)
+
+        assert row["stable_income_cents"] == 20_00000
+        assert row["living_expense_cents"] == 0
+        assert row["one_time_income_cents"] == 0
+        assert row["reimbursable_expense_cents"] == 320000
+        assert row["reimbursement_income_cents"] == 320000
+        assert row["net_operating_cashflow_cents"] == 20_00000
+        assert row["net_total_cashflow_cents"] == 20_00000
 
 
 class TestHistoricalFiltering:
