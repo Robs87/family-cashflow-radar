@@ -22,6 +22,7 @@ from app.main import (
     run_recurring_generation,
     save_beecount_token_config,
     save_beecount_category_mapping,
+    save_decision_simulation,
     save_fixed_bill_template,
     save_manual_override,
     save_mortgage_template,
@@ -105,6 +106,9 @@ class TestRenderDashboard:
         assert 'action="/actions/update-mortgage-template"' not in html
         assert "先创建房贷模板，再添加提前还款计划" in html
         assert 'action="/actions/generate-recurring"' in html
+        assert "决策模拟" in html
+        assert 'action="/actions/decision-simulation"' in html
+        assert "最近模拟结果" in html
         assert "本月稳定收入" in html
         assert "20,000.00 元" in html
         assert "本月刚性支出" in html
@@ -798,6 +802,32 @@ class TestRecurringWebActions:
         assert "电话费" in html
         assert "99.00" in html
 
+    def test_save_decision_simulation_renders_result(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO monthly_cashflow
+               (year, month, stable_income_cents, living_expense_cents,
+                fixed_expense_cents, debt_payment_cents, net_operating_cashflow_cents)
+               VALUES (2026, 5, 2000000, 500000, 300000, 200000, 1000000)"""
+        )
+        conn.commit()
+        conn.close()
+
+        result = save_decision_simulation(
+            db_path,
+            "提前还 5 万",
+            "mortgage_prepayment",
+            "50000",
+            "2026-06",
+            "one_time",
+        )
+
+        assert result["ok"] is True
+        html = render_dashboard_html(db_path)
+        assert "提前还 5 万" in html
+        assert "最近模拟结果" in html
+        assert "现金流压力" in html
+
 
 class TestHttpHandler:
     def test_serves_index(self, dashboard_server):
@@ -1033,6 +1063,57 @@ class TestHttpHandler:
 
         conn = sqlite3.connect(str(db_path))
         count = conn.execute("SELECT COUNT(*) FROM normalized_transactions").fetchone()[0]
+        conn.close()
+        assert count == 1
+
+    def test_post_decision_simulation(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO monthly_cashflow
+               (year, month, stable_income_cents, living_expense_cents,
+                fixed_expense_cents, debt_payment_cents, net_operating_cashflow_cents)
+               VALUES (2026, 5, 2000000, 500000, 300000, 200000, 1000000)"""
+        )
+        conn.commit()
+        conn.close()
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {"db_path": db_path, "raw_input_path": FIXTURES_DIR, "beecount_config_path": None},
+        )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            data = urlencode(
+                {
+                    "scenario_name": "投资加仓",
+                    "decision_type": "investment",
+                    "amount_yuan": "10000",
+                    "start_month": "2026-06",
+                    "payment_type": "one_time",
+                }
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/actions/decision-simulation",
+                data=data,
+                method="POST",
+            )
+            request.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert response.status == 200
+        assert "模拟已保存" in body
+        assert "投资加仓" in body
+
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute("SELECT COUNT(*) FROM decision_scenarios").fetchone()[0]
         conn.close()
         assert count == 1
 

@@ -45,6 +45,12 @@ from app.scripts.recurring import (
     update_mortgage_prepayment,
 )
 from app.scripts.schema_migrations import ensure_v02_schema
+from app.scripts.simulate_decision import (
+    DECISION_TYPES,
+    PAYMENT_TYPES,
+    parse_yuan_to_cents as parse_simulation_yuan_to_cents,
+    save_decision_scenario,
+)
 
 
 DEFAULT_DB = Path("data/processed/cashflow.db")
@@ -76,6 +82,15 @@ DIRECTION_OPTIONS = [
     ("inflow", "流入"),
     ("outflow", "流出"),
     ("neutral", "中性"),
+]
+DECISION_TYPE_OPTIONS = [
+    ("mortgage_prepayment", "提前还贷"),
+    ("large_purchase", "大额消费 / 买车"),
+    ("investment", "投资加仓"),
+]
+PAYMENT_TYPE_OPTIONS = [
+    ("one_time", "一次性支付"),
+    ("installment", "分期 / 月供"),
 ]
 ADVICE_REQUIRED_CATEGORY_TYPES = {
     "living_expense",
@@ -368,6 +383,16 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
                ORDER BY e.prepayment_date DESC, e.id DESC
                LIMIT 8"""
         ).fetchall()
+        decision_scenarios = conn.execute(
+            """SELECT id, scenario_name, decision_type, amount_cents, start_month,
+                      payment_type, installment_months, monthly_payment_cents,
+                      result_risk_level, result_min_cash_cents,
+                      result_min_safety_months, recommendation, explanation,
+                      created_at
+               FROM decision_scenarios
+               ORDER BY id DESC
+               LIMIT 6"""
+        ).fetchall()
     finally:
         conn.close()
 
@@ -391,6 +416,7 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
         "upcoming_bills": [dict(row) for row in upcoming_bills],
         "debt_split_summary": dict(debt_split_summary) if debt_split_summary else {},
         "prepayment_events": [dict(row) for row in prepayment_events],
+        "decision_scenarios": [dict(row) for row in decision_scenarios],
     }
 
 
@@ -953,6 +979,46 @@ def update_saved_mortgage_prepayment(
     except Exception as exc:
         return {"ok": False, "message": str(exc)}
     return {"ok": True, "message": f"提前还贷事件已更新，后续还款计划已重算: #{new_event_id}"}
+
+
+def save_decision_simulation(
+    db_path: Path,
+    scenario_name: str,
+    decision_type: str,
+    amount_yuan: str,
+    start_month: str,
+    payment_type: str,
+    *,
+    installment_months_text: str = "",
+    monthly_payment_yuan: str = "",
+) -> dict:
+    try:
+        if not scenario_name.strip():
+            return {"ok": False, "message": "请填写模拟名称"}
+        if decision_type not in DECISION_TYPES:
+            return {"ok": False, "message": "不支持的决策类型"}
+        if payment_type not in PAYMENT_TYPES:
+            return {"ok": False, "message": "不支持的支付方式"}
+        installment_months = int(installment_months_text) if installment_months_text.strip() else None
+        monthly_payment_cents = (
+            parse_simulation_yuan_to_cents(monthly_payment_yuan) if monthly_payment_yuan.strip() else None
+        )
+        scenario_id, simulation = save_decision_scenario(
+            db_path,
+            scenario_name.strip(),
+            decision_type,
+            parse_simulation_yuan_to_cents(amount_yuan),
+            start_month.strip(),
+            payment_type=payment_type,
+            installment_months=installment_months,
+            monthly_payment_cents=monthly_payment_cents,
+        )
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+    return {
+        "ok": True,
+        "message": f"模拟已保存: #{scenario_id} · {simulation.risk_level} · {simulation.recommendation}",
+    }
 
 
 def _metric(label: str, value: str, tone: str = "neutral") -> str:
@@ -1534,6 +1600,74 @@ def _render_prepayment_events(rows: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def _decision_type_label(value: str) -> str:
+    labels = dict(DECISION_TYPE_OPTIONS)
+    return labels.get(value, value)
+
+
+def _payment_type_label(value: str) -> str:
+    labels = dict(PAYMENT_TYPE_OPTIONS)
+    return labels.get(value, value)
+
+
+def _render_decision_simulator_form() -> str:
+    current_month = date.today().strftime("%Y-%m")
+    decision_options = _render_options(DECISION_TYPE_OPTIONS, "mortgage_prepayment")
+    payment_options = _render_options(PAYMENT_TYPE_OPTIONS, "one_time")
+    return (
+        '<form class="entry-form compact-form" method="post" action="/actions/decision-simulation">'
+        '<h3>决策模拟</h3>'
+        '<label>名称<input name="scenario_name" placeholder="例如：提前还 10 万" required></label>'
+        f'<label>类型<select name="decision_type">{decision_options}</select></label>'
+        '<label>金额<input type="number" name="amount_yuan" min="0" step="0.01" placeholder="100000" required></label>'
+        f'<label>开始月份<input type="month" name="start_month" value="{html.escape(current_month)}" required></label>'
+        f'<label>支付方式<select name="payment_type">{payment_options}</select></label>'
+        '<label>分期月数<input type="number" name="installment_months" min="1" step="1" placeholder="可选"></label>'
+        '<label>月供<input type="number" name="monthly_payment_yuan" min="0" step="0.01" placeholder="可选"></label>'
+        '<button type="submit">保存模拟</button>'
+        "</form>"
+    )
+
+
+def _risk_label(value: str | None) -> str:
+    labels = {
+        "safe": "可执行",
+        "watch": "观察",
+        "tight": "谨慎",
+        "danger": "不建议",
+    }
+    return labels.get(value or "", value or "unknown")
+
+
+def _render_decision_scenarios(rows: list[dict]) -> str:
+    if not rows:
+        return '<p class="empty">暂无决策模拟结果</p>'
+    parts = []
+    for row in rows:
+        amount = _format_yuan(row["amount_cents"])
+        monthly_payment = ""
+        if row.get("monthly_payment_cents"):
+            monthly_payment = f' · 月供 {_format_yuan(row["monthly_payment_cents"])} 元'
+        elif row.get("installment_months"):
+            monthly_payment = f' · {int(row["installment_months"])} 期'
+        parts.append(
+            '<div class="list-row">'
+            '<div class="list-main">'
+            f'<strong>{html.escape(row["scenario_name"])} · {html.escape(_risk_label(row.get("result_risk_level")))}</strong>'
+            f'<span>{html.escape(_decision_type_label(row["decision_type"]))} · '
+            f'{html.escape(_payment_type_label(row["payment_type"]))} · '
+            f'{html.escape(row["start_month"])} · 安全垫 '
+            f'{html.escape(str(row.get("result_min_safety_months") or 0))} 个月'
+            f'{html.escape(monthly_payment)}</span>'
+            f'<span>{html.escape(row.get("recommendation") or "")}</span>'
+            f'<span>{html.escape(row.get("explanation") or "")}</span>'
+            "</div>"
+            f'<b class="amount amount-outflow">{html.escape(amount)} 元</b>'
+            "</div>"
+        )
+    return "\n".join(parts)
+
+
 def _render_recurring_templates(rows: list[dict]) -> str:
     if not rows:
         return '<p class="empty">暂无周期账单模板</p>'
@@ -1777,6 +1911,7 @@ def render_dashboard_html(
     add_transaction_form_html = _render_add_transaction_form()
     recurring_forms_html = _render_recurring_forms()
     mortgage_prepayment_form_html = _render_mortgage_prepayment_form(data["mortgage_templates"])
+    decision_simulator_form_html = _render_decision_simulator_form()
     advice_html = _render_financial_advice(data)
     recent_transactions_html = _render_recent_transactions(data["recent_transactions"])
     expense_breakdown_html = _render_expense_breakdown(data["expense_breakdown"])
@@ -1789,6 +1924,7 @@ def render_dashboard_html(
     upcoming_bills_html = _render_upcoming_bills(data["upcoming_bills"])
     debt_split_summary_html = _render_debt_split_summary(data["debt_split_summary"])
     prepayment_events_html = _render_prepayment_events(data["prepayment_events"])
+    decision_scenarios_html = _render_decision_scenarios(data["decision_scenarios"])
     edit_prepayment = next(
         (row for row in data["prepayment_events"] if edit_prepayment_id and int(row["id"]) == edit_prepayment_id),
         None,
@@ -2345,6 +2481,7 @@ def render_dashboard_html(
         <h2>自动记账</h2>
         {recurring_forms_html}
         {mortgage_prepayment_form_html}
+        {decision_simulator_form_html}
       </div>
       <div class="panel">
         <h2>周期账单</h2>
@@ -2403,6 +2540,12 @@ def render_dashboard_html(
         <h2>提前还贷事件</h2>
         <div class="breakdown-list" id="prepayment-list">
           {prepayment_events_html}
+        </div>
+      </div>
+      <div class="panel">
+        <h2>最近模拟结果</h2>
+        <div class="breakdown-list">
+          {decision_scenarios_html}
         </div>
       </div>
     </section>
@@ -2559,6 +2702,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 status = 500
         elif parsed.path == "/actions/generate-recurring":
             notice = self._handle_generate_recurring()
+            try:
+                body = render_dashboard_html(self.db_path, notice=notice).encode("utf-8")
+                status = 200 if notice["ok"] else 400
+            except sqlite3.Error as exc:
+                body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
+                status = 500
+        elif parsed.path == "/actions/decision-simulation":
+            notice = self._handle_decision_simulation()
             try:
                 body = render_dashboard_html(self.db_path, notice=notice).encode("utf-8")
                 status = 200 if notice["ok"] else 400
@@ -2736,6 +2887,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         raw_body = self.rfile.read(content_length).decode("utf-8")
         fields = parse_qs(raw_body)
         return run_recurring_generation(self.db_path, fields.get("as_of", [""])[0])
+
+    def _handle_decision_simulation(self) -> dict:
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        raw_body = self.rfile.read(content_length).decode("utf-8")
+        fields = parse_qs(raw_body)
+        return save_decision_simulation(
+            self.db_path,
+            fields.get("scenario_name", [""])[0],
+            fields.get("decision_type", [""])[0],
+            fields.get("amount_yuan", [""])[0],
+            fields.get("start_month", [""])[0],
+            fields.get("payment_type", [""])[0],
+            installment_months_text=fields.get("installment_months", [""])[0],
+            monthly_payment_yuan=fields.get("monthly_payment_yuan", [""])[0],
+        )
 
     def _handle_beecount_token_config(self) -> dict:
         content_length = int(self.headers.get("Content-Length", "0") or 0)
