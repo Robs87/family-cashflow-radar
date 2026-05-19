@@ -3,9 +3,11 @@
 import sqlite3
 import subprocess
 import sys
+from decimal import Decimal
 
 import pytest
 
+from app.scripts.recurring import create_mortgage_template
 from app.scripts.simulate_decision import (
     parse_yuan_to_cents,
     save_decision_scenario,
@@ -93,6 +95,32 @@ def test_save_decision_scenario_persists_recommendation(db_path):
     assert row[1] == "mortgage_prepayment"
     assert row[2] == simulation.risk_level
     assert row[3]
+
+
+def test_mortgage_prepayment_estimates_interest_savings(db_path):
+    template_id = create_mortgage_template(
+        db_path,
+        "房贷",
+        1_000_000,
+        Decimal("3.6"),
+        12,
+        "2026-01-15",
+        15,
+    )
+
+    result = simulate_decision(
+        db_path,
+        "mortgage_prepayment",
+        300_000,
+        "2026-04",
+        mortgage_template_id=template_id,
+        mortgage_effect_type="reduce_term",
+    )
+
+    assert result.interest_savings_cents > 0
+    assert result.term_months_delta > 0
+    assert "节省未来利息" in result.explanation
+    assert "还款期数减少" in result.explanation
 
 
 def test_cli_prints_stable_summary(db_path):

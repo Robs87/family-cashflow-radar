@@ -991,6 +991,8 @@ def save_decision_simulation(
     *,
     installment_months_text: str = "",
     monthly_payment_yuan: str = "",
+    mortgage_template_id_text: str = "",
+    mortgage_effect_type: str = "reduce_term",
 ) -> dict:
     try:
         if not scenario_name.strip():
@@ -1003,6 +1005,7 @@ def save_decision_simulation(
         monthly_payment_cents = (
             parse_simulation_yuan_to_cents(monthly_payment_yuan) if monthly_payment_yuan.strip() else None
         )
+        mortgage_template_id = int(mortgage_template_id_text) if mortgage_template_id_text.strip() else None
         scenario_id, simulation = save_decision_scenario(
             db_path,
             scenario_name.strip(),
@@ -1012,6 +1015,8 @@ def save_decision_simulation(
             payment_type=payment_type,
             installment_months=installment_months,
             monthly_payment_cents=monthly_payment_cents,
+            mortgage_template_id=mortgage_template_id,
+            mortgage_effect_type=mortgage_effect_type,
         )
     except Exception as exc:
         return {"ok": False, "message": str(exc)}
@@ -1610,10 +1615,21 @@ def _payment_type_label(value: str) -> str:
     return labels.get(value, value)
 
 
-def _render_decision_simulator_form() -> str:
+def _render_decision_simulator_form(mortgage_templates: list[dict]) -> str:
     current_month = date.today().strftime("%Y-%m")
     decision_options = _render_options(DECISION_TYPE_OPTIONS, "mortgage_prepayment")
     payment_options = _render_options(PAYMENT_TYPE_OPTIONS, "one_time")
+    mortgage_options = '<option value="">自动选择</option>' + "".join(
+        f'<option value="{int(row["id"])}">{html.escape(row["name"])}</option>'
+        for row in mortgage_templates
+    )
+    effect_options = _render_options(
+        [
+            ("reduce_term", "月供不变，缩短期限"),
+            ("reduce_payment", "期限不变，降低月供"),
+        ],
+        "reduce_term",
+    )
     return (
         '<form class="entry-form compact-form" method="post" action="/actions/decision-simulation">'
         '<h3>决策模拟</h3>'
@@ -1624,6 +1640,8 @@ def _render_decision_simulator_form() -> str:
         f'<label>支付方式<select name="payment_type">{payment_options}</select></label>'
         '<label>分期月数<input type="number" name="installment_months" min="1" step="1" placeholder="可选"></label>'
         '<label>月供<input type="number" name="monthly_payment_yuan" min="0" step="0.01" placeholder="可选"></label>'
+        f'<label>房贷<select name="mortgage_template_id">{mortgage_options}</select></label>'
+        f'<label>提前还贷方式<select name="mortgage_effect_type">{effect_options}</select></label>'
         '<button type="submit">保存模拟</button>'
         "</form>"
     )
@@ -1911,7 +1929,7 @@ def render_dashboard_html(
     add_transaction_form_html = _render_add_transaction_form()
     recurring_forms_html = _render_recurring_forms()
     mortgage_prepayment_form_html = _render_mortgage_prepayment_form(data["mortgage_templates"])
-    decision_simulator_form_html = _render_decision_simulator_form()
+    decision_simulator_form_html = _render_decision_simulator_form(data["mortgage_templates"])
     advice_html = _render_financial_advice(data)
     recent_transactions_html = _render_recent_transactions(data["recent_transactions"])
     expense_breakdown_html = _render_expense_breakdown(data["expense_breakdown"])
@@ -2901,6 +2919,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             fields.get("payment_type", [""])[0],
             installment_months_text=fields.get("installment_months", [""])[0],
             monthly_payment_yuan=fields.get("monthly_payment_yuan", [""])[0],
+            mortgage_template_id_text=fields.get("mortgage_template_id", [""])[0],
+            mortgage_effect_type=fields.get("mortgage_effect_type", ["reduce_term"])[0],
         )
 
     def _handle_beecount_token_config(self) -> dict:

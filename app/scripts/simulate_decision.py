@@ -5,15 +5,19 @@ import argparse
 import sqlite3
 import sys
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from app.scripts.recurring import build_equal_payment_schedule, build_fixed_payment_schedule
+
 
 DECISION_TYPES = {"mortgage_prepayment", "large_purchase", "investment"}
 PAYMENT_TYPES = {"one_time", "installment"}
+MORTGAGE_EFFECT_TYPES = {"reduce_term", "reduce_payment"}
 
 
 @dataclass(frozen=True)
@@ -25,6 +29,8 @@ class DecisionSimulation:
     explanation: str
     suggested_max_amount_cents: int
     risk_month: str
+    interest_savings_cents: int = 0
+    term_months_delta: int = 0
 
 
 def parse_yuan_to_cents(value: str) -> int:
@@ -74,6 +80,98 @@ def _latest_month(conn: sqlite3.Connection) -> sqlite3.Row:
     return row
 
 
+def _estimate_mortgage_prepayment_savings(
+    conn: sqlite3.Connection,
+    *,
+    amount_cents: int,
+    start_month: str,
+    mortgage_template_id: int | None,
+    mortgage_effect_type: str,
+) -> tuple[int, int, str]:
+    if mortgage_effect_type not in MORTGAGE_EFFECT_TYPES:
+        raise ValueError("提前还贷方式必须是 reduce_term 或 reduce_payment")
+
+    if mortgage_template_id is None:
+        template = conn.execute(
+            """SELECT t.*, d.principal_initial_cents, d.interest_rate
+               FROM recurring_bill_templates t
+               JOIN debts d ON d.id = t.debt_id
+               WHERE t.enabled = 1 AND t.bill_type = 'mortgage'
+               ORDER BY t.id DESC
+               LIMIT 1"""
+        ).fetchone()
+    else:
+        template = conn.execute(
+            """SELECT t.*, d.principal_initial_cents, d.interest_rate
+               FROM recurring_bill_templates t
+               JOIN debts d ON d.id = t.debt_id
+               WHERE t.id = ? AND t.bill_type = 'mortgage'""",
+            (mortgage_template_id,),
+        ).fetchone()
+    if template is None:
+        return 0, 0, " 未找到可用房贷模板，暂不能估算利息节省。"
+
+    event_date = date.fromisoformat(f"{start_month}-01")
+    next_row = conn.execute(
+        """SELECT *
+           FROM mortgage_repayment_schedule
+           WHERE recurring_template_id = ?
+             AND due_date >= ?
+           ORDER BY due_date
+           LIMIT 1""",
+        (template["id"], event_date.isoformat()),
+    ).fetchone()
+    if next_row is None:
+        return 0, 0, " 该房贷在模拟月份之后没有剩余还款计划，暂不能估算利息节省。"
+
+    previous_row = conn.execute(
+        """SELECT *
+           FROM mortgage_repayment_schedule
+           WHERE recurring_template_id = ?
+             AND due_date < ?
+           ORDER BY due_date DESC
+           LIMIT 1""",
+        (template["id"], event_date.isoformat()),
+    ).fetchone()
+    remaining_before = (
+        int(previous_row["remaining_principal_cents"])
+        if previous_row
+        else int(template["principal_initial_cents"])
+    )
+    if amount_cents > remaining_before:
+        return 0, 0, " 提前还款金额超过当时剩余本金，暂不能估算利息节省。"
+    remaining_after = remaining_before - amount_cents
+
+    original_rows = conn.execute(
+        """SELECT interest_cents
+           FROM mortgage_repayment_schedule
+           WHERE recurring_template_id = ?
+             AND due_date >= ?
+           ORDER BY due_date""",
+        (template["id"], next_row["due_date"]),
+    ).fetchall()
+    original_interest = sum(int(row["interest_cents"]) for row in original_rows)
+    original_count = len(original_rows)
+    if remaining_after == 0:
+        return original_interest, original_count, (
+            f" 按当前房贷计划估算，可节省未来利息约 {format_yuan(original_interest)} 元，贷款提前结清。"
+        )
+
+    annual_rate = Decimal(str(template["interest_rate"] or 0))
+    if mortgage_effect_type == "reduce_payment":
+        new_rows = build_equal_payment_schedule(remaining_after, annual_rate, max(1, original_count))
+    else:
+        new_rows = build_fixed_payment_schedule(remaining_after, annual_rate, int(template["amount_cents"] or 0))
+    new_interest = sum(int(row["interest_cents"]) for row in new_rows)
+    interest_savings = max(0, original_interest - new_interest)
+    term_delta = max(0, original_count - len(new_rows))
+    effect_label = "降低月供" if mortgage_effect_type == "reduce_payment" else "缩短期限"
+    return interest_savings, term_delta, (
+        f" 按当前房贷计划和“{effect_label}”估算，可节省未来利息约 {format_yuan(interest_savings)} 元，"
+        f"还款期数减少 {term_delta} 期。"
+    )
+
+
 def _scenario_monthly_outflow(
     *,
     decision_type: str,
@@ -109,6 +207,8 @@ def simulate_decision(
     expected_income_impact_cents: int = 0,
     expected_expense_impact_cents: int = 0,
     horizon_months: int = 6,
+    mortgage_template_id: int | None = None,
+    mortgage_effect_type: str = "reduce_term",
 ) -> DecisionSimulation:
     if decision_type not in DECISION_TYPES:
         raise ValueError("不支持的决策类型")
@@ -124,6 +224,17 @@ def simulate_decision(
     conn.row_factory = sqlite3.Row
     try:
         latest = _latest_month(conn)
+        interest_savings_cents, term_months_delta, mortgage_detail = (
+            _estimate_mortgage_prepayment_savings(
+                conn,
+                amount_cents=amount_cents,
+                start_month=start_month,
+                mortgage_template_id=mortgage_template_id,
+                mortgage_effect_type=mortgage_effect_type,
+            )
+            if decision_type == "mortgage_prepayment"
+            else (0, 0, "")
+        )
     finally:
         conn.close()
 
@@ -180,7 +291,7 @@ def simulate_decision(
     if min_balance < 0:
         detail = f"{horizon_months} 个月内最低缺口 {format_yuan(min_balance)} 元，风险月份 {risk_month}。"
     if decision_type == "mortgage_prepayment":
-        detail += " 当前只评估现金流压力；利息节省需要结合房贷计划单独比较。"
+        detail += mortgage_detail
     elif decision_type == "investment":
         detail += " 当前不预测投资收益，只按本金占用现金流处理。"
 
@@ -192,6 +303,8 @@ def simulate_decision(
         explanation=detail,
         suggested_max_amount_cents=max(suggested_max, 0),
         risk_month=risk_month,
+        interest_savings_cents=interest_savings_cents,
+        term_months_delta=term_months_delta,
     )
 
 
@@ -207,6 +320,8 @@ def save_decision_scenario(
     monthly_payment_cents: int | None = None,
     expected_income_impact_cents: int = 0,
     expected_expense_impact_cents: int = 0,
+    mortgage_template_id: int | None = None,
+    mortgage_effect_type: str = "reduce_term",
 ) -> tuple[int, DecisionSimulation]:
     simulation = simulate_decision(
         db_path,
@@ -218,6 +333,8 @@ def save_decision_scenario(
         monthly_payment_cents=monthly_payment_cents,
         expected_income_impact_cents=expected_income_impact_cents,
         expected_expense_impact_cents=expected_expense_impact_cents,
+        mortgage_template_id=mortgage_template_id,
+        mortgage_effect_type=mortgage_effect_type,
     )
     conn = sqlite3.connect(str(db_path))
     try:
@@ -261,6 +378,8 @@ def main() -> None:
     parser.add_argument("--payment-type", choices=sorted(PAYMENT_TYPES), default="one_time")
     parser.add_argument("--installment-months", type=int)
     parser.add_argument("--monthly-payment", help="月供，单位元；留空则按总额/月数估算")
+    parser.add_argument("--mortgage-template-id", type=int)
+    parser.add_argument("--mortgage-effect-type", choices=sorted(MORTGAGE_EFFECT_TYPES), default="reduce_term")
     args = parser.parse_args()
 
     try:
@@ -275,6 +394,8 @@ def main() -> None:
             payment_type=args.payment_type,
             installment_months=args.installment_months,
             monthly_payment_cents=monthly_payment_cents,
+            mortgage_template_id=args.mortgage_template_id,
+            mortgage_effect_type=args.mortgage_effect_type,
         )
     except Exception as exc:
         print(str(exc), file=sys.stderr)
@@ -285,6 +406,7 @@ def main() -> None:
         f"scenario_id={scenario_id} "
         f"risk_level={result.risk_level} "
         f"min_safety_months={result.min_safety_months:.2f} "
+        f"interest_savings_cents={result.interest_savings_cents} "
         f"suggested_max_amount_cents={result.suggested_max_amount_cents}"
     )
 

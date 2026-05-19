@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import urllib.error
 import urllib.request
+from decimal import Decimal
 from urllib.parse import urlencode
 from http.server import ThreadingHTTPServer
 
@@ -36,6 +37,7 @@ from app.scripts.classify import classify
 from app.scripts.generate_monthly_cashflow import generate_monthly_cashflow
 from app.scripts.import_csv import import_csv
 from app.scripts.normalize import normalize
+from app.scripts.recurring import create_mortgage_template
 from tests.conftest import FIXTURES_DIR, SCHEMA_SQL, SEED_RULES_SQL
 
 
@@ -108,6 +110,8 @@ class TestRenderDashboard:
         assert 'action="/actions/generate-recurring"' in html
         assert "决策模拟" in html
         assert 'action="/actions/decision-simulation"' in html
+        assert 'name="mortgage_template_id"' in html
+        assert 'name="mortgage_effect_type"' in html
         assert "最近模拟结果" in html
         assert "本月稳定收入" in html
         assert "20,000.00 元" in html
@@ -826,7 +830,43 @@ class TestRecurringWebActions:
         html = render_dashboard_html(db_path)
         assert "提前还 5 万" in html
         assert "最近模拟结果" in html
-        assert "现金流压力" in html
+        assert "执行后安全垫" in html or "不建议执行" in html
+
+    def test_save_decision_simulation_includes_mortgage_interest_savings(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO monthly_cashflow
+               (year, month, stable_income_cents, living_expense_cents,
+                fixed_expense_cents, debt_payment_cents, net_operating_cashflow_cents)
+               VALUES (2026, 5, 2000000, 500000, 300000, 200000, 1000000)"""
+        )
+        conn.commit()
+        conn.close()
+        template_id = create_mortgage_template(
+            db_path,
+            "房贷",
+            1_000_000,
+            Decimal("3.6"),
+            12,
+            "2026-01-15",
+            15,
+        )
+
+        result = save_decision_simulation(
+            db_path,
+            "提前还 3000",
+            "mortgage_prepayment",
+            "3000",
+            "2026-04",
+            "one_time",
+            mortgage_template_id_text=str(template_id),
+            mortgage_effect_type="reduce_term",
+        )
+
+        assert result["ok"] is True
+        html = render_dashboard_html(db_path)
+        assert "节省未来利息" in html
+        assert "还款期数减少" in html
 
 
 class TestHttpHandler:
