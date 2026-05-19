@@ -1,5 +1,6 @@
 """Tests for app/main.py: dashboard HTML and HTTP handler."""
 
+import json
 import sqlite3
 import threading
 import urllib.error
@@ -12,10 +13,15 @@ import pytest
 from app.main import (
     DashboardHandler,
     _build_cashflow_signal,
+    _build_financial_advice,
+    _resolve_beecount_source,
     _format_yuan,
+    render_beecount_settings_html,
     render_dashboard_html,
     run_refresh_pipeline,
     run_recurring_generation,
+    save_beecount_token_config,
+    save_beecount_category_mapping,
     save_fixed_bill_template,
     save_manual_override,
     save_mortgage_template,
@@ -56,6 +62,7 @@ def db_with_dashboard_data(db_path):
 def dashboard_server(db_with_dashboard_data):
     class TestHandler(DashboardHandler):
         db_path = db_with_dashboard_data
+        beecount_config_path = None
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -82,6 +89,7 @@ class TestRenderDashboard:
 
         assert "<title>家庭现金流雷达</title>" in html
         assert 'action="/actions/refresh"' in html
+        assert 'href="/settings/beecount"' in html
         assert "刷新数据" in html
         assert "记录一笔收入或支出" in html
         assert 'action="/actions/add-transaction"' in html
@@ -106,12 +114,148 @@ class TestRenderDashboard:
         assert "本月基础结余" in html
         assert "5,450.00 元" in html
         assert "近 12 月基础结余趋势" in html
-        assert "unknown 待审核" in html
+        assert "语义待处理" in html
+        assert "BeeCount unknown" in html
+        assert "BeeCount pending" in html
+        assert "历史 unknown" in html
+        assert "历史 pending" in html
         assert 'id="review-panel"' in html
         assert 'action="/actions/manual-override#review-panel"' in html
         assert 'data-preserve-scroll="review"' in html
+        assert 'name="category_l2_preset"' in html
+        assert 'name="category_l2_custom"' in html
+        assert "自定义添加" in html
+        assert "支出明细" in html
         assert "family-cashflow-radar.reviewScrollY" in html
         assert "稳定收入" in html
+
+    def test_renders_beecount_settings_without_token_values(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "beecount_source.json"
+        monkeypatch.setattr("app.main.token_is_configured", lambda env_name: env_name == "BEECOUNT_REFRESH_TOKEN")
+
+        html = render_beecount_settings_html(
+            config_path=config_path,
+            beecount_base_url="https://bee.example",
+            beecount_ledger_id="ledger-1",
+        )
+
+        assert "BeeCount 连接配置" in html
+        assert 'name="access_token"' in html
+        assert "access token：未配置" in html
+        assert "refresh token：已配置" in html
+        assert "留空则不覆盖 Keychain 中已有值" in html
+
+    def test_renders_beecount_category_mappings(self, db_path, tmp_path, monkeypatch):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO beecount_category_mappings
+               (beecount_kind, category_name, radar_cashflow_direction,
+                radar_financial_type, radar_category_l1, radar_category_l2)
+               VALUES ('expense', '早餐', 'outflow', 'living_expense', '日常生活', '早餐')"""
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr("app.main.token_is_configured", lambda env_name: False)
+
+        html = render_beecount_settings_html(
+            db_path=db_path,
+            config_path=tmp_path / "beecount_source.json",
+            beecount_base_url="https://bee.example",
+            beecount_ledger_id="ledger-1",
+        )
+
+        assert "BeeCount 分类映射" in html
+        assert "早餐" in html
+        assert 'action="/actions/beecount-category-mapping"' in html
+        assert "日常生活" in html
+
+    def test_save_beecount_category_mapping_updates_semantics(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO beecount_category_mappings
+               (beecount_kind, category_name, radar_cashflow_direction,
+                radar_financial_type, radar_category_l1, radar_category_l2)
+               VALUES ('expense', '新分类', 'outflow', 'unknown', '未映射', '新分类')"""
+        )
+        mapping_id = conn.execute("SELECT id FROM beecount_category_mappings").fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        result = save_beecount_category_mapping(
+            db_path,
+            str(mapping_id),
+            "outflow",
+            "living_expense",
+            "日常生活",
+            "新分类",
+            "1",
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            """SELECT radar_financial_type, radar_category_l1, mapping_source
+               FROM beecount_category_mappings WHERE id = ?""",
+            (mapping_id,),
+        ).fetchone()
+        conn.close()
+
+        assert result["ok"] is True
+        assert row == ("living_expense", "日常生活", "manual")
+
+    def test_save_beecount_token_config_writes_tokens_to_keychain_and_config(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "beecount_source.json"
+        calls = []
+
+        def fake_write(config_path_arg, **kwargs):
+            calls.append((config_path_arg, kwargs))
+            config_path_arg.write_text(json.dumps({"base_url": kwargs["base_url"]}), encoding="utf-8")
+
+        monkeypatch.setattr("app.main.write_beecount_config", fake_write)
+
+        result = save_beecount_token_config(
+            config_path,
+            "https://bee.example/",
+            "ledger-1",
+            "200",
+            access_token="access-secret",
+            refresh_token="refresh-secret",
+        )
+
+        assert result == {"ok": True, "message": "BeeCount 连接配置已保存，token 已写入 Keychain"}
+        assert calls == [
+            (
+                config_path,
+                {
+                    "base_url": "https://bee.example",
+                    "ledger_id": "ledger-1",
+                    "limit": 200,
+                    "access_token": "access-secret",
+                    "refresh_token": "refresh-secret",
+                    "access_token_env": "BEECOUNT_ACCESS_TOKEN",
+                    "refresh_token_env": "BEECOUNT_REFRESH_TOKEN",
+                },
+            )
+        ]
+
+    def test_save_beecount_token_config_rejects_bad_url(self, tmp_path):
+        result = save_beecount_token_config(tmp_path / "source.json", "bee.example", "ledger-1", "200")
+
+        assert result["ok"] is False
+        assert "base URL" in result["message"]
+
+    def test_save_beecount_token_config_can_update_config_without_overwriting_tokens(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "beecount_source.json"
+
+        def fake_write(config_path_arg, **kwargs):
+            assert kwargs["access_token"] == ""
+            assert kwargs["refresh_token"] == ""
+            config_path_arg.write_text(json.dumps({"base_url": kwargs["base_url"]}), encoding="utf-8")
+
+        monkeypatch.setattr("app.main.write_beecount_config", fake_write)
+
+        result = save_beecount_token_config(config_path, "https://bee.example", "ledger-1", "200")
+
+        assert result == {"ok": True, "message": "BeeCount 连接配置已保存，Keychain token 未覆盖"}
 
     def test_renders_twelve_month_trend_limit(self, db_path):
         conn = sqlite3.connect(str(db_path))
@@ -135,7 +279,7 @@ class TestRenderDashboard:
         assert "暂无月份" in html
         assert "暂无月度现金流数据" in html
         assert "当前家庭现金流：观察状态" in html
-        assert "unknown 待审核</span><strong>0</strong>" in html
+        assert "BeeCount unknown</span><strong>0</strong>" in html
 
     def test_initializes_empty_database_before_rendering(self, tmp_path):
         db_path = tmp_path / "fresh.db"
@@ -224,6 +368,8 @@ class TestRenderDashboard:
         signal = _build_cashflow_signal(
             {
                 "latest_month": {
+                    "year": 2026,
+                    "month": 5,
                     "stable_income_cents": 2_000_000,
                     "living_expense_cents": 100_000,
                     "fixed_expense_cents": 300_000,
@@ -238,6 +384,54 @@ class TestRenderDashboard:
         assert signal["level"] == "safe"
         assert signal["label"] == "安全状态"
         assert signal["safety_months"] == 2.8
+        assert signal["confidence"] == "high"
+
+    def test_cashflow_signal_uses_known_future_30_day_risk(self):
+        signal = _build_cashflow_signal(
+            {
+                "latest_month": {
+                    "year": 2026,
+                    "month": 5,
+                    "stable_income_cents": 2_000_000,
+                    "living_expense_cents": 100_000,
+                    "fixed_expense_cents": 100_000,
+                    "debt_payment_cents": 100_000,
+                    "net_operating_cashflow_cents": 500_000,
+                },
+                "unknown_count": 0,
+                "pending_count": 0,
+                "upcoming_bills": [
+                    {"due_date": "2026-05-20", "amount_cents": 600_000},
+                    {"due_date": "2026-08-30", "amount_cents": 800_000},
+                ],
+            }
+        )
+
+        assert signal["level"] == "tight"
+        assert signal["risk_next_30_cents"] == 600_000
+        assert signal["risk_next_90_cents"] == 600_000
+        assert "未来 30 天不建议新增大额支出" in signal["headline"]
+
+    def test_cashflow_signal_marks_missing_income_as_low_confidence(self):
+        signal = _build_cashflow_signal(
+            {
+                "latest_month": {
+                    "year": 2026,
+                    "month": 5,
+                    "stable_income_cents": 0,
+                    "living_expense_cents": 100_000,
+                    "fixed_expense_cents": 100_000,
+                    "debt_payment_cents": 0,
+                    "net_operating_cashflow_cents": -200_000,
+                },
+                "unknown_count": 0,
+                "pending_count": 0,
+            }
+        )
+
+        assert signal["level"] == "danger"
+        assert signal["confidence"] == "low"
+        assert "本月缺少稳定收入记录" in signal["reason"]
 
 
 class TestRefreshPipeline:
@@ -260,6 +454,111 @@ class TestRefreshPipeline:
         conn.close()
         assert monthly_count == 3
         assert rules_count > 0
+
+    def test_refresh_pipeline_can_use_beecount_json_source(self, tmp_path):
+        db_path = tmp_path / "fresh.db"
+
+        result = run_refresh_pipeline(
+            db_path,
+            FIXTURES_DIR,
+            beecount_input_json=FIXTURES_DIR / "sample_beecount_transactions.json",
+        )
+
+        assert result["ok"] is True
+        assert [step["label"] for step in result["steps"]] == [
+            "同步 BeeCount",
+            "标准化交易",
+            "规则分类",
+            "生成月度现金流",
+        ]
+
+        conn = sqlite3.connect(str(db_path))
+        raw_count = conn.execute(
+            "SELECT COUNT(*) FROM raw_transactions WHERE raw_hash LIKE 'beecount_cloud:%'"
+        ).fetchone()[0]
+        normalized_count = conn.execute("SELECT COUNT(*) FROM normalized_transactions").fetchone()[0]
+        monthly_count = conn.execute("SELECT COUNT(*) FROM monthly_cashflow").fetchone()[0]
+        conn.close()
+        assert raw_count == 3
+        assert normalized_count == 3
+        assert monthly_count == 1
+
+    def test_refresh_pipeline_can_use_beecount_config_file(self, tmp_path):
+        db_path = tmp_path / "fresh.db"
+        config_path = tmp_path / "beecount_source.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "input_json": str(FIXTURES_DIR / "sample_beecount_transactions.json"),
+                    "ledger_id": "ledger_family_demo",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = run_refresh_pipeline(db_path, FIXTURES_DIR, beecount_config_path=config_path)
+
+        assert result["ok"] is True
+        assert result["steps"][0]["label"] == "同步 BeeCount"
+        assert "imported=3" in result["steps"][0]["stdout"]
+
+    def test_beecount_config_file_can_select_read_api_source(self, tmp_path):
+        config_path = tmp_path / "beecount_source.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "base_url": "https://bee.332626.xyz:9090",
+                    "ledger_id": "1",
+                    "access_token_env": "BEECOUNT_ACCESS_TOKEN",
+                    "refresh_token_env": "BEECOUNT_REFRESH_TOKEN",
+                    "limit": 200,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        source = _resolve_beecount_source(
+            config_path,
+            beecount_input_json=None,
+            beecount_base_url=None,
+            beecount_ledger_id=None,
+            beecount_access_token_env="IGNORED_WHEN_CONFIG_EXISTS",
+            beecount_refresh_token_env="IGNORED_WHEN_CONFIG_EXISTS",
+            beecount_limit=500,
+        )
+
+        assert source == {
+            "beecount_input_json": None,
+            "beecount_base_url": "https://bee.332626.xyz:9090",
+            "beecount_ledger_id": "1",
+            "beecount_access_token_env": "BEECOUNT_ACCESS_TOKEN",
+            "beecount_refresh_token_env": "BEECOUNT_REFRESH_TOKEN",
+            "beecount_limit": 200,
+        }
+
+    def test_read_api_config_fails_fast_when_token_env_missing(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "fresh.db"
+        config_path = tmp_path / "beecount_source.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "base_url": "https://bee.332626.xyz:9090",
+                    "ledger_id": "1",
+                    "access_token_env": "BEECOUNT_ACCESS_TOKEN_MISSING_FOR_TEST",
+                    "refresh_token_env": "BEECOUNT_REFRESH_TOKEN_MISSING_FOR_TEST",
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("BEECOUNT_ACCESS_TOKEN_MISSING_FOR_TEST", raising=False)
+        monkeypatch.delenv("BEECOUNT_REFRESH_TOKEN_MISSING_FOR_TEST", raising=False)
+
+        result = run_refresh_pipeline(db_path, FIXTURES_DIR, beecount_config_path=config_path)
+
+        assert result["ok"] is False
+        assert result["steps"][0]["label"] == "同步 BeeCount"
+        assert "BEECOUNT_ACCESS_TOKEN_MISSING_FOR_TEST 未设置" in result["steps"][0]["stderr"]
+        assert "BEECOUNT_REFRESH_TOKEN_MISSING_FOR_TEST 未设置" in result["steps"][0]["stderr"]
 
     def test_refresh_pipeline_stops_on_import_failure(self, db_path, tmp_path):
         missing_input = tmp_path / "missing"
@@ -284,24 +583,30 @@ class TestManualOverride:
         ).fetchone()[0]
         conn.close()
 
-        result = save_manual_override(db_with_dashboard_data, txn_id, "fixed_expense", "outflow")
+        result = save_manual_override(db_with_dashboard_data, txn_id, "fixed_expense", "outflow", category_l2="保险")
 
         assert result == {"ok": True, "message": "人工修正已保存"}
         conn = sqlite3.connect(str(db_with_dashboard_data))
         row = conn.execute(
-            """SELECT manual_financial_type, manual_cashflow_direction, review_status
+            """SELECT manual_financial_type, manual_cashflow_direction, manual_category_l2, review_status
                FROM normalized_transactions
                WHERE id = ?""",
             (txn_id,),
         ).fetchone()
         conn.close()
-        assert row == ("fixed_expense", "outflow", "approved")
+        assert row == ("fixed_expense", "outflow", "保险", "approved")
 
     def test_save_manual_override_rejects_invalid_type(self, db_with_dashboard_data):
         result = save_manual_override(db_with_dashboard_data, 1, "bad_type", "outflow")
 
         assert result["ok"] is False
         assert "不支持的财务类型" in result["message"]
+
+    def test_save_manual_override_requires_advice_category_for_outflow(self, db_with_dashboard_data):
+        result = save_manual_override(db_with_dashboard_data, 1, "living_expense", "outflow")
+
+        assert result["ok"] is False
+        assert "二级分类" in result["message"]
 
 
 class TestAddTransaction:
@@ -336,6 +641,65 @@ class TestAddTransaction:
 
         assert result["ok"] is False
         assert "说明" in result["message"]
+
+    def test_save_new_transaction_requires_advice_category_for_outflow(self, db_path):
+        result = save_new_transaction(db_path, "2026-05-16", "68", "outflow", "living_expense", "午饭 外卖")
+
+        assert result["ok"] is False
+        assert "二级分类" in result["message"]
+
+
+class TestFinancialAdvice:
+    def test_advice_uses_expense_breakdown_items(self):
+        advice = _build_financial_advice(
+            {
+                "latest_month": {
+                    "year": 2026,
+                    "month": 5,
+                    "stable_income_cents": 20_000_00,
+                    "living_expense_cents": 8_000_00,
+                    "fixed_expense_cents": 2_000_00,
+                    "debt_payment_cents": 1_000_00,
+                    "net_operating_cashflow_cents": 9_000_00,
+                },
+                "unknown_count": 0,
+                "advice_category_gap": {"amount_cents": 0, "transaction_count": 0},
+                "expense_breakdown": [
+                    {
+                        "effective_financial_type": "living_expense",
+                        "category": "餐饮",
+                        "amount_cents": 3_500_00,
+                    },
+                    {
+                        "effective_financial_type": "living_expense",
+                        "category": "打车",
+                        "amount_cents": 2_000_00,
+                    },
+                ],
+            }
+        )
+
+        assert any("餐饮 3,500.00 元" in item and "打车 2,000.00 元" in item for item in advice)
+
+    def test_advice_downgrades_when_category_gap_exists(self):
+        advice = _build_financial_advice(
+            {
+                "latest_month": {
+                    "year": 2026,
+                    "month": 5,
+                    "stable_income_cents": 20_000_00,
+                    "living_expense_cents": 6_000_00,
+                    "fixed_expense_cents": 2_000_00,
+                    "debt_payment_cents": 1_000_00,
+                    "net_operating_cashflow_cents": 11_000_00,
+                },
+                "unknown_count": 0,
+                "advice_category_gap": {"amount_cents": 4_200_00, "transaction_count": 3},
+                "expense_breakdown": [],
+            }
+        )
+
+        assert any("4,200.00 元支出缺少二级明细" in item for item in advice)
 
 
 class TestRecurringWebActions:
@@ -458,7 +822,7 @@ class TestHttpHandler:
         TestHandler = type(
             "TestHandler",
             (DashboardHandler,),
-            {"db_path": db_path, "raw_input_path": FIXTURES_DIR},
+            {"db_path": db_path, "raw_input_path": FIXTURES_DIR, "beecount_config_path": None},
         )
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
@@ -482,6 +846,37 @@ class TestHttpHandler:
         assert "本月稳定收入" in body
         assert "20,000.00 元" in body
 
+    def test_post_refresh_runs_beecount_pipeline_when_configured(self, db_path):
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {
+                "db_path": db_path,
+                "raw_input_path": FIXTURES_DIR,
+                "beecount_input_json": FIXTURES_DIR / "sample_beecount_transactions.json",
+                "beecount_config_path": None,
+            },
+        )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/actions/refresh",
+                data=b"",
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert response.status == 200
+        assert "同步 BeeCount" in body
+
     def test_post_manual_override(self, db_with_dashboard_data):
         conn = sqlite3.connect(str(db_with_dashboard_data))
         txn_id = conn.execute(
@@ -496,14 +891,25 @@ class TestHttpHandler:
         TestHandler = type(
             "TestHandler",
             (DashboardHandler,),
-            {"db_path": db_with_dashboard_data, "raw_input_path": FIXTURES_DIR},
+            {
+                "db_path": db_with_dashboard_data,
+                "raw_input_path": FIXTURES_DIR,
+                "beecount_config_path": None,
+            },
         )
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            data = f"transaction_id={txn_id}&financial_type=fixed_expense&cashflow_direction=outflow".encode("utf-8")
+            data = urlencode(
+                {
+                    "transaction_id": str(txn_id),
+                    "financial_type": "fixed_expense",
+                    "cashflow_direction": "outflow",
+                    "category_l2_preset": "固定支出::保险",
+                }
+            ).encode("utf-8")
             request = urllib.request.Request(
                 f"http://127.0.0.1:{server.server_port}/actions/manual-override",
                 data=data,
@@ -521,11 +927,11 @@ class TestHttpHandler:
         assert "人工修正已保存" in body
         conn = sqlite3.connect(str(db_with_dashboard_data))
         status = conn.execute(
-            "SELECT review_status FROM normalized_transactions WHERE id = ?",
+            "SELECT review_status, manual_category_l1, manual_category_l2 FROM normalized_transactions WHERE id = ?",
             (txn_id,),
-        ).fetchone()[0]
+        ).fetchone()
         conn.close()
-        assert status == "approved"
+        assert status == ("approved", "固定支出", "保险")
 
     def test_post_manual_override_rejects_bad_payload(self, dashboard_server):
         request = urllib.request.Request(
@@ -541,7 +947,7 @@ class TestHttpHandler:
         TestHandler = type(
             "TestHandler",
             (DashboardHandler,),
-            {"db_path": db_path, "raw_input_path": FIXTURES_DIR},
+            {"db_path": db_path, "raw_input_path": FIXTURES_DIR, "beecount_config_path": None},
         )
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
@@ -555,7 +961,7 @@ class TestHttpHandler:
                     "cashflow_direction": "outflow",
                     "financial_type": "living_expense",
                     "description": "午饭 外卖",
-                    "category_l2": "餐饮",
+                    "category_l2_preset": "日常生活::餐饮",
                 }
             ).encode("utf-8")
             request = urllib.request.Request(
@@ -573,8 +979,57 @@ class TestHttpHandler:
 
         assert response.status == 200
         assert "新记录已保存" in body
-        assert "午饭 外卖" in body
-        assert "68.00 元" in body
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT category_l1, category_l2 FROM normalized_transactions WHERE description = '午饭 外卖'"
+        ).fetchone()
+        conn.close()
+        assert row == ("日常生活", "餐饮")
+
+    def test_post_add_transaction_accepts_custom_category(self, db_path):
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {"db_path": db_path, "raw_input_path": FIXTURES_DIR, "beecount_config_path": None},
+        )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            data = urlencode(
+                {
+                    "transaction_date": "2026-05-17",
+                    "amount_yuan": "128",
+                    "cashflow_direction": "outflow",
+                    "financial_type": "living_expense",
+                    "description": "临时支出",
+                    "category_l2_preset": "__custom__",
+                    "category_l2_custom": "临时杂项",
+                }
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/actions/add-transaction",
+                data=data,
+                method="POST",
+            )
+            request.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert response.status == 200
+        assert "新记录已保存" in body
+        conn = sqlite3.connect(str(db_path))
+        category_l2 = conn.execute(
+            "SELECT category_l2 FROM normalized_transactions WHERE description = '临时支出'"
+        ).fetchone()[0]
+        conn.close()
+        assert category_l2 == "临时杂项"
 
         conn = sqlite3.connect(str(db_path))
         count = conn.execute("SELECT COUNT(*) FROM normalized_transactions").fetchone()[0]

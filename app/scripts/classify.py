@@ -16,6 +16,11 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.scripts.schema_migrations import ensure_v02_schema
+from app.scripts.beecount_category_mappings import (
+    apply_beecount_mapping,
+    load_mappings,
+    sync_mappings_from_raw_transactions,
+)
 
 
 TEXT_FIELDS = ("category_l1", "category_l2", "account", "counterparty", "description")
@@ -136,6 +141,8 @@ def _condition_matches(row: dict[str, Any], rule: dict[str, Any]) -> bool:
 def _review_status(row: dict[str, Any], rule: dict[str, Any]) -> str:
     if rule["target_financial_type"] == "unknown":
         return "pending"
+    if str(row.get("source_file") or "").startswith("beecount_cloud:"):
+        return "approved"
     if float(rule["confidence"]) < 0.8:
         return "pending"
     if int(row["is_large_amount"]) == 1:
@@ -164,10 +171,15 @@ def classify(db_path: Path, dry_run: bool = False, verbose: bool = False) -> Non
 
     try:
         rules = _load_rules(conn)
+        sync_mappings_from_raw_transactions(conn)
+        mappings = load_mappings(conn)
         rows = cursor.execute(
-            """SELECT *
-               FROM normalized_transactions
-               ORDER BY id ASC"""
+            """SELECT n.*, r.source_file
+                      , r.direction_raw AS raw_direction
+                      , r.category_original AS beecount_category
+               FROM normalized_transactions n
+               JOIN raw_transactions r ON r.id = n.raw_transaction_id
+               ORDER BY n.id ASC"""
         ).fetchall()
 
         for sqlite_row in rows:
@@ -178,12 +190,14 @@ def classify(db_path: Path, dry_run: bool = False, verbose: bool = False) -> Non
                     print(f"  id={row['id']}: manual override, skipped")
                 continue
 
-            try:
-                rule = _classify_row(row, rules)
-            except ValueError as exc:
-                print(f"错误: normalized_transactions.id={row['id']}: {exc}", file=sys.stderr)
-                total_failed += 1
-                continue
+            rule = apply_beecount_mapping(row, mappings)
+            if not rule:
+                try:
+                    rule = _classify_row(row, rules)
+                except ValueError as exc:
+                    print(f"错误: normalized_transactions.id={row['id']}: {exc}", file=sys.stderr)
+                    total_failed += 1
+                    continue
 
             status = _review_status(row, rule)
             if rule["target_financial_type"] == "unknown":

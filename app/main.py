@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import html
 import io
+import json
 import sqlite3
 import sys
 from datetime import date
@@ -18,7 +19,20 @@ if __package__ in (None, ""):
 
 from app.scripts.classify import classify
 from app.scripts.add_transaction import add_manual_transaction, parse_amount_cents
+from app.scripts.analyze_cashflow import analyze_cashflow
+from app.scripts.beecount_tokens import (
+    DEFAULT_ACCESS_TOKEN_ENV,
+    DEFAULT_REFRESH_TOKEN_ENV,
+    token_is_configured,
+    write_beecount_config,
+)
+from app.scripts.beecount_category_mappings import (
+    DIRECTIONS as MAPPING_DIRECTIONS,
+    FINANCIAL_TYPES as MAPPING_FINANCIAL_TYPES,
+    ensure_mapping_schema,
+)
 from app.scripts.generate_monthly_cashflow import generate_monthly_cashflow
+from app.scripts.import_beecount import import_beecount
 from app.scripts.import_csv import import_csv
 from app.scripts.normalize import normalize
 from app.scripts.recurring import (
@@ -35,6 +49,8 @@ from app.scripts.schema_migrations import ensure_v02_schema
 
 DEFAULT_DB = Path("data/processed/cashflow.db")
 DEFAULT_RAW_INPUT = Path("data/raw")
+DEFAULT_BEECOUNT_CONFIG = Path("data/processed/beecount_source.json")
+DEFAULT_BEECOUNT_BASE_URL = "https://bee.332626.xyz:9090"
 SCHEMA_SQL = Path(__file__).resolve().parent / "db" / "schema.sql"
 SEED_RULES_SQL = Path(__file__).resolve().parent / "db" / "seed_rules.sql"
 FINANCIAL_TYPE_OPTIONS = [
@@ -61,6 +77,46 @@ DIRECTION_OPTIONS = [
     ("outflow", "流出"),
     ("neutral", "中性"),
 ]
+ADVICE_REQUIRED_CATEGORY_TYPES = {
+    "living_expense",
+    "fixed_expense",
+    "debt_payment",
+    "reimbursable_expense",
+    "investment_outflow",
+    "asset_purchase",
+}
+CATEGORY_L2_PRESETS = [
+    ("日常生活", "餐饮"),
+    ("日常生活", "外卖"),
+    ("日常生活", "超市日用"),
+    ("日常生活", "交通"),
+    ("日常生活", "打车"),
+    ("日常生活", "购物"),
+    ("日常生活", "娱乐"),
+    ("日常生活", "医疗"),
+    ("日常生活", "育儿"),
+    ("固定支出", "房租"),
+    ("固定支出", "物业"),
+    ("固定支出", "水电燃气"),
+    ("固定支出", "宽带"),
+    ("固定支出", "电话费"),
+    ("固定支出", "保险"),
+    ("固定支出", "订阅服务"),
+    ("债务还款", "房贷本金"),
+    ("债务还款", "房贷利息"),
+    ("债务还款", "车贷"),
+    ("债务还款", "信用贷"),
+    ("债务还款", "提前还款"),
+    ("投资流出", "基金定投"),
+    ("投资流出", "股票买入"),
+    ("投资流出", "理财买入"),
+    ("资产购入", "车辆"),
+    ("资产购入", "装修"),
+    ("资产购入", "家电"),
+    ("资产购入", "大件购置"),
+    ("工作垫付", "差旅垫付"),
+    ("工作垫付", "采购垫付"),
+]
 
 
 def _format_yuan(cents: int) -> str:
@@ -79,6 +135,41 @@ def _direction_label(value: str) -> str:
 
 def _financial_type_label(value: str) -> str:
     return dict(FINANCIAL_TYPE_OPTIONS).get(value, value or "")
+
+
+def _requires_advice_category(financial_type: str, cashflow_direction: str) -> bool:
+    return cashflow_direction == "outflow" and financial_type in ADVICE_REQUIRED_CATEGORY_TYPES
+
+
+def _validate_advice_category(financial_type: str, cashflow_direction: str, category_l2: str) -> str | None:
+    if _requires_advice_category(financial_type, cashflow_direction) and not category_l2.strip():
+        return f"{_financial_type_label(financial_type)}需要填写二级分类，才能给出针对性的财务建议"
+    return None
+
+
+def _category_preset_value(category_l1: str, category_l2: str) -> str:
+    return f"{category_l1}::{category_l2}"
+
+
+def _split_category_preset(value: str) -> tuple[str, str]:
+    if "::" not in value:
+        return "", ""
+    category_l1, category_l2 = value.split("::", 1)
+    return category_l1.strip(), category_l2.strip()
+
+
+def _resolve_category_fields(fields: dict[str, list[str]]) -> tuple[str, str]:
+    fallback_l1 = fields.get("category_l1", [""])[0].strip()
+    fallback_l2 = fields.get("category_l2", [""])[0].strip()
+    custom_l2 = fields.get("category_l2_custom", [""])[0].strip()
+    preset = fields.get("category_l2_preset", [""])[0].strip()
+    preset_l1, preset_l2 = _split_category_preset(preset)
+
+    if custom_l2:
+        return fallback_l1 or preset_l1, custom_l2
+    if preset_l2:
+        return preset_l1 or fallback_l1, preset_l2
+    return fallback_l1, fallback_l2
 
 
 def _fetch_dashboard_data(db_path: Path) -> dict:
@@ -103,12 +194,35 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
                   SUM(CASE WHEN review_status = 'pending' THEN 1 ELSE 0 END) AS pending_count
                FROM normalized_transactions"""
         ).fetchone()
+        source_review = conn.execute(
+            """SELECT
+                  SUM(CASE
+                        WHEN r.source_file LIKE 'beecount_cloud:%'
+                         AND COALESCE(n.manual_financial_type, n.financial_type) = 'unknown'
+                        THEN 1 ELSE 0 END) AS beecount_unknown_count,
+                  SUM(CASE
+                        WHEN r.source_file LIKE 'beecount_cloud:%'
+                         AND n.review_status = 'pending'
+                        THEN 1 ELSE 0 END) AS beecount_pending_count,
+                  SUM(CASE
+                        WHEN r.source_file NOT LIKE 'beecount_cloud:%'
+                         AND COALESCE(n.manual_financial_type, n.financial_type) = 'unknown'
+                        THEN 1 ELSE 0 END) AS legacy_unknown_count,
+                  SUM(CASE
+                        WHEN r.source_file NOT LIKE 'beecount_cloud:%'
+                         AND n.review_status = 'pending'
+                        THEN 1 ELSE 0 END) AS legacy_pending_count
+               FROM normalized_transactions n
+               JOIN raw_transactions r ON r.id = n.raw_transaction_id"""
+        ).fetchone()
         review_transactions = conn.execute(
             """SELECT id,
                       transaction_date,
                       amount_cents,
                       COALESCE(manual_cashflow_direction, cashflow_direction) AS effective_direction,
                       COALESCE(manual_financial_type, financial_type) AS effective_financial_type,
+                      COALESCE(NULLIF(manual_category_l1, ''), category_l1) AS effective_category_l1,
+                      COALESCE(NULLIF(manual_category_l2, ''), category_l2) AS effective_category_l2,
                       account,
                       counterparty,
                       description,
@@ -116,6 +230,14 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
                FROM normalized_transactions
                WHERE review_status = 'pending'
                   OR COALESCE(manual_financial_type, financial_type) = 'unknown'
+                  OR (
+                    COALESCE(manual_cashflow_direction, cashflow_direction) = 'outflow'
+                    AND COALESCE(manual_financial_type, financial_type) IN (
+                      'living_expense', 'fixed_expense', 'debt_payment',
+                      'reimbursable_expense', 'investment_outflow', 'asset_purchase'
+                    )
+                    AND COALESCE(NULLIF(manual_category_l2, ''), NULLIF(category_l2, '')) IS NULL
+                  )
                ORDER BY transaction_date DESC, id DESC
                LIMIT 20"""
         ).fetchall()
@@ -124,8 +246,8 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
                       amount_cents,
                       COALESCE(manual_cashflow_direction, cashflow_direction) AS effective_direction,
                       COALESCE(manual_financial_type, financial_type) AS effective_financial_type,
-                      category_l1,
-                      category_l2,
+                      COALESCE(NULLIF(manual_category_l1, ''), category_l1) AS category_l1,
+                      COALESCE(NULLIF(manual_category_l2, ''), category_l2) AS category_l2,
                       description
                FROM normalized_transactions
                ORDER BY transaction_date DESC, id DESC
@@ -135,7 +257,11 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
         if latest_month:
             expense_breakdown = conn.execute(
                 """SELECT COALESCE(manual_financial_type, financial_type) AS effective_financial_type,
-                          COALESCE(category_l2, category_l1, '未分类') AS category,
+                          COALESCE(
+                            NULLIF(COALESCE(NULLIF(manual_category_l2, ''), category_l2), ''),
+                            NULLIF(COALESCE(NULLIF(manual_category_l1, ''), category_l1), ''),
+                            '未分类'
+                          ) AS category,
                           SUM(amount_cents) AS amount_cents,
                           COUNT(*) AS transaction_count
                    FROM normalized_transactions
@@ -144,13 +270,29 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
                      AND COALESCE(manual_cashflow_direction, cashflow_direction) = 'outflow'
                      AND COALESCE(manual_financial_type, financial_type) IN (
                         'living_expense', 'fixed_expense', 'debt_payment',
-                        'investment_outflow', 'asset_purchase'
+                        'reimbursable_expense', 'investment_outflow', 'asset_purchase'
                      )
                    GROUP BY effective_financial_type, category
                    ORDER BY amount_cents DESC
                    LIMIT 8""",
                 (latest_month["year"], latest_month["month"]),
             ).fetchall()
+            advice_category_gap = conn.execute(
+                """SELECT COALESCE(SUM(amount_cents), 0) AS amount_cents,
+                          COUNT(*) AS transaction_count
+                   FROM normalized_transactions
+                   WHERE year = ?
+                     AND month = ?
+                     AND COALESCE(manual_cashflow_direction, cashflow_direction) = 'outflow'
+                     AND COALESCE(manual_financial_type, financial_type) IN (
+                        'living_expense', 'fixed_expense', 'debt_payment',
+                        'reimbursable_expense', 'investment_outflow', 'asset_purchase'
+                     )
+                     AND COALESCE(NULLIF(manual_category_l2, ''), NULLIF(category_l2, '')) IS NULL""",
+                (latest_month["year"], latest_month["month"]),
+            ).fetchone()
+        else:
+            advice_category_gap = None
         recurring_templates = conn.execute(
             """SELECT t.id,
                       t.name,
@@ -234,9 +376,16 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
         "trend": [dict(row) for row in reversed(trend)],
         "unknown_count": int((review["unknown_count"] if review else 0) or 0),
         "pending_count": int((review["pending_count"] if review else 0) or 0),
+        "beecount_unknown_count": int((source_review["beecount_unknown_count"] if source_review else 0) or 0),
+        "beecount_pending_count": int((source_review["beecount_pending_count"] if source_review else 0) or 0),
+        "legacy_unknown_count": int((source_review["legacy_unknown_count"] if source_review else 0) or 0),
+        "legacy_pending_count": int((source_review["legacy_pending_count"] if source_review else 0) or 0),
         "review_transactions": [dict(row) for row in review_transactions],
         "recent_transactions": [dict(row) for row in recent_transactions],
         "expense_breakdown": [dict(row) for row in expense_breakdown],
+        "advice_category_gap": dict(advice_category_gap)
+        if advice_category_gap
+        else {"amount_cents": 0, "transaction_count": 0},
         "recurring_templates": [dict(row) for row in recurring_templates],
         "mortgage_templates": [dict(row) for row in mortgage_templates],
         "upcoming_bills": [dict(row) for row in upcoming_bills],
@@ -286,7 +435,196 @@ def _run_step(label: str, func, *args) -> dict:
     }
 
 
-def run_refresh_pipeline(db_path: Path, input_path: Path = DEFAULT_RAW_INPUT) -> dict:
+def _beecount_source_configured(
+    beecount_input_json: Path | None,
+    beecount_base_url: str | None,
+    beecount_ledger_id: str | None,
+) -> bool:
+    return bool(beecount_input_json or (beecount_base_url and beecount_ledger_id))
+
+
+def _load_beecount_source_config(config_path: Path | None) -> dict:
+    if not config_path or not config_path.exists():
+        return {}
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("BeeCount 配置文件必须是 JSON 对象")
+
+    config_dir = config_path.parent
+    input_json = payload.get("input_json") or payload.get("inputJson")
+    resolved_input = None
+    if input_json:
+        resolved_input = Path(str(input_json))
+        if not resolved_input.is_absolute():
+            resolved_input = config_dir / resolved_input
+
+    return {
+        "beecount_input_json": resolved_input,
+        "beecount_base_url": payload.get("base_url") or payload.get("baseUrl"),
+        "beecount_ledger_id": payload.get("ledger_id") or payload.get("ledgerId"),
+        "beecount_access_token_env": payload.get("access_token_env")
+        or payload.get("accessTokenEnv")
+        or "BEECOUNT_ACCESS_TOKEN",
+        "beecount_refresh_token_env": payload.get("refresh_token_env")
+        or payload.get("refreshTokenEnv")
+        or "BEECOUNT_REFRESH_TOKEN",
+        "beecount_limit": int(payload.get("limit") or 500),
+    }
+
+
+def _resolve_beecount_source(
+    config_path: Path | None,
+    beecount_input_json: Path | None,
+    beecount_base_url: str | None,
+    beecount_ledger_id: str | None,
+    beecount_access_token_env: str,
+    beecount_refresh_token_env: str,
+    beecount_limit: int,
+) -> dict:
+    if _beecount_source_configured(beecount_input_json, beecount_base_url, beecount_ledger_id):
+        return {
+            "beecount_input_json": beecount_input_json,
+            "beecount_base_url": beecount_base_url,
+            "beecount_ledger_id": beecount_ledger_id,
+            "beecount_access_token_env": beecount_access_token_env,
+            "beecount_refresh_token_env": beecount_refresh_token_env,
+            "beecount_limit": beecount_limit,
+        }
+    config = _load_beecount_source_config(config_path)
+    if not config:
+        return {
+            "beecount_input_json": None,
+            "beecount_base_url": None,
+            "beecount_ledger_id": None,
+            "beecount_access_token_env": beecount_access_token_env,
+            "beecount_refresh_token_env": beecount_refresh_token_env,
+            "beecount_limit": beecount_limit,
+        }
+    return config
+
+
+def save_beecount_token_config(
+    config_path: Path | None,
+    base_url: str,
+    ledger_id: str,
+    limit_text: str,
+    access_token: str = "",
+    refresh_token: str = "",
+    access_token_env: str = DEFAULT_ACCESS_TOKEN_ENV,
+    refresh_token_env: str = DEFAULT_REFRESH_TOKEN_ENV,
+) -> dict:
+    if not config_path:
+        return {"ok": False, "message": "未配置 BeeCount 配置文件路径"}
+    base_url = base_url.strip().rstrip("/")
+    ledger_id = ledger_id.strip()
+    if not base_url.startswith(("http://", "https://")):
+        return {"ok": False, "message": "BeeCount base URL 必须以 http:// 或 https:// 开头"}
+    if not ledger_id:
+        return {"ok": False, "message": "请填写 BeeCount ledger id"}
+    try:
+        limit = int(limit_text or "500")
+    except ValueError:
+        return {"ok": False, "message": "读取上限必须是整数"}
+    if limit <= 0:
+        return {"ok": False, "message": "读取上限必须大于 0"}
+
+    wrote_tokens = bool(access_token.strip() or refresh_token.strip())
+    try:
+        write_beecount_config(
+            config_path,
+            base_url=base_url,
+            ledger_id=ledger_id,
+            limit=limit,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            access_token_env=access_token_env.strip() or DEFAULT_ACCESS_TOKEN_ENV,
+            refresh_token_env=refresh_token_env.strip() or DEFAULT_REFRESH_TOKEN_ENV,
+        )
+    except Exception as exc:
+        return {"ok": False, "message": f"BeeCount token 保存失败: {exc}"}
+    if wrote_tokens:
+        return {"ok": True, "message": "BeeCount 连接配置已保存，token 已写入 Keychain"}
+    return {"ok": True, "message": "BeeCount 连接配置已保存，Keychain token 未覆盖"}
+
+
+def _fetch_beecount_category_mappings(db_path: Path | None) -> list[dict]:
+    if not db_path:
+        return []
+    _ensure_database_initialized(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        ensure_mapping_schema(conn)
+        rows = conn.execute(
+            """SELECT *
+               FROM beecount_category_mappings
+               ORDER BY enabled ASC, beecount_kind, category_name, parent_name"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def save_beecount_category_mapping(
+    db_path: Path,
+    mapping_id_text: str,
+    cashflow_direction: str,
+    financial_type: str,
+    category_l1: str,
+    category_l2: str,
+    enabled_text: str = "1",
+) -> dict:
+    try:
+        mapping_id = int(mapping_id_text)
+    except ValueError:
+        return {"ok": False, "message": "BeeCount 映射 ID 无效"}
+    if cashflow_direction not in MAPPING_DIRECTIONS:
+        return {"ok": False, "message": f"不支持的现金流方向: {cashflow_direction}"}
+    if financial_type not in MAPPING_FINANCIAL_TYPES:
+        return {"ok": False, "message": f"不支持的财务类型: {financial_type}"}
+    enabled = 1 if enabled_text == "1" else 0
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        ensure_mapping_schema(conn)
+        result = conn.execute(
+            """UPDATE beecount_category_mappings
+               SET radar_cashflow_direction = ?,
+                   radar_financial_type = ?,
+                   radar_category_l1 = ?,
+                   radar_category_l2 = ?,
+                   enabled = ?,
+                   mapping_source = 'manual',
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (
+                cashflow_direction,
+                financial_type,
+                category_l1.strip(),
+                category_l2.strip(),
+                enabled,
+                mapping_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if result.rowcount == 0:
+        return {"ok": False, "message": "未找到 BeeCount 分类映射"}
+    return {"ok": True, "message": "BeeCount 分类映射已更新；下次刷新或重新分类后生效"}
+
+
+def run_refresh_pipeline(
+    db_path: Path,
+    input_path: Path = DEFAULT_RAW_INPUT,
+    beecount_config_path: Path | None = None,
+    beecount_input_json: Path | None = None,
+    beecount_base_url: str | None = None,
+    beecount_ledger_id: str | None = None,
+    beecount_access_token_env: str = "BEECOUNT_ACCESS_TOKEN",
+    beecount_refresh_token_env: str = "BEECOUNT_REFRESH_TOKEN",
+    beecount_limit: int = 500,
+) -> dict:
     started_steps = []
     try:
         _ensure_database_initialized(db_path)
@@ -304,8 +642,37 @@ def run_refresh_pipeline(db_path: Path, input_path: Path = DEFAULT_RAW_INPUT) ->
             ],
         }
 
+    beecount_source = _resolve_beecount_source(
+        beecount_config_path,
+        beecount_input_json,
+        beecount_base_url,
+        beecount_ledger_id,
+        beecount_access_token_env,
+        beecount_refresh_token_env,
+        beecount_limit,
+    )
+
+    if _beecount_source_configured(
+        beecount_source["beecount_input_json"],
+        beecount_source["beecount_base_url"],
+        beecount_source["beecount_ledger_id"],
+    ):
+        source_step = (
+            "同步 BeeCount",
+            import_beecount,
+            db_path,
+            beecount_source["beecount_input_json"],
+            beecount_source["beecount_base_url"],
+            beecount_source["beecount_ledger_id"],
+            beecount_source["beecount_access_token_env"],
+            beecount_source["beecount_refresh_token_env"],
+            beecount_source["beecount_limit"],
+        )
+    else:
+        source_step = ("导入 CSV", import_csv, db_path, input_path)
+
     steps = [
-        ("导入 CSV", import_csv, db_path, input_path),
+        source_step,
         ("标准化交易", normalize, db_path),
         ("规则分类", classify, db_path),
         ("生成月度现金流", generate_monthly_cashflow, db_path),
@@ -324,6 +691,8 @@ def save_manual_override(
     transaction_id: int,
     financial_type: str,
     cashflow_direction: str,
+    category_l1: str = "",
+    category_l2: str = "",
 ) -> dict:
     allowed_types = {value for value, _label in FINANCIAL_TYPE_OPTIONS}
     allowed_directions = {value for value, _label in DIRECTION_OPTIONS}
@@ -331,6 +700,9 @@ def save_manual_override(
         return {"ok": False, "message": f"不支持的财务类型: {financial_type}"}
     if cashflow_direction not in allowed_directions:
         return {"ok": False, "message": f"不支持的现金流方向: {cashflow_direction}"}
+    category_error = _validate_advice_category(financial_type, cashflow_direction, category_l2)
+    if category_error:
+        return {"ok": False, "message": category_error}
 
     conn = sqlite3.connect(str(db_path))
     try:
@@ -338,11 +710,13 @@ def save_manual_override(
             """UPDATE normalized_transactions
                SET manual_financial_type = ?,
                    manual_cashflow_direction = ?,
+                   manual_category_l1 = ?,
+                   manual_category_l2 = ?,
                    review_status = 'approved',
                    manual_updated_at = CURRENT_TIMESTAMP,
                    updated_at = CURRENT_TIMESTAMP
                WHERE id = ?""",
-            (financial_type, cashflow_direction, transaction_id),
+            (financial_type, cashflow_direction, category_l1.strip() or None, category_l2.strip() or None, transaction_id),
         )
         if cursor.rowcount == 0:
             return {"ok": False, "message": f"未找到交易: {transaction_id}"}
@@ -375,6 +749,9 @@ def save_new_transaction(
         return {"ok": False, "message": f"不支持的现金流方向: {cashflow_direction}"}
     if not description.strip():
         return {"ok": False, "message": "请填写这笔记录的说明"}
+    category_error = _validate_advice_category(financial_type, cashflow_direction, category_l2)
+    if category_error:
+        return {"ok": False, "message": category_error}
 
     try:
         amount_cents = parse_amount_cents(amount_yuan)
@@ -641,12 +1018,329 @@ def _render_notice(notice: dict | None) -> str:
     return f'<section class="notice notice-{tone}">{html.escape(notice["message"])}</section>'
 
 
+def _render_token_status(label: str, configured: bool) -> str:
+    tone = "good" if configured else "bad"
+    text = "已配置" if configured else "未配置"
+    return f'<span class="token-status {tone}">{html.escape(label)}：{html.escape(text)}</span>'
+
+
+def _render_beecount_mapping_rows(rows: list[dict]) -> str:
+    if not rows:
+        return '<p class="empty">暂无 BeeCount 分类映射。先刷新一次 BeeCount 数据后会自动生成。</p>'
+    rendered = []
+    direction_options = _render_options(DIRECTION_OPTIONS, "")
+    type_options = _render_options(FINANCIAL_TYPE_OPTIONS, "")
+    for row in rows:
+        direction_select = direction_options.replace(
+            f'value="{html.escape(row["radar_cashflow_direction"])}"',
+            f'value="{html.escape(row["radar_cashflow_direction"])}" selected',
+            1,
+        )
+        type_select = type_options.replace(
+            f'value="{html.escape(row["radar_financial_type"])}"',
+            f'value="{html.escape(row["radar_financial_type"])}" selected',
+            1,
+        )
+        enabled_checked = " checked" if int(row["enabled"] or 0) == 1 else ""
+        source = str(row.get("mapping_source") or "")
+        rendered.append(
+            '<form class="mapping-row" method="post" action="/actions/beecount-category-mapping">'
+            f'<input type="hidden" name="mapping_id" value="{int(row["id"])}">'
+            '<div class="mapping-source">'
+            f'<strong>{html.escape(str(row["category_name"] or ""))}</strong>'
+            f'<span>{html.escape(str(row["beecount_kind"] or ""))}'
+            f'{(" / " + html.escape(str(row["parent_name"]))) if row.get("parent_name") else ""}'
+            f' · {html.escape(source)}</span>'
+            "</div>"
+            f'<select name="cashflow_direction">{direction_select}</select>'
+            f'<select name="financial_type">{type_select}</select>'
+            f'<input name="category_l1" value="{html.escape(str(row["radar_category_l1"] or ""))}" placeholder="一级">'
+            f'<input name="category_l2" value="{html.escape(str(row["radar_category_l2"] or ""))}" placeholder="二级">'
+            '<label class="mapping-enabled">'
+            f'<input type="checkbox" name="enabled" value="1"{enabled_checked}>启用'
+            '</label>'
+            '<button type="submit">保存</button>'
+            "</form>"
+        )
+    return "\n".join(rendered)
+
+
+def render_beecount_settings_html(
+    *,
+    db_path: Path | None = None,
+    config_path: Path | None,
+    beecount_input_json: Path | None = None,
+    beecount_base_url: str | None = None,
+    beecount_ledger_id: str | None = None,
+    beecount_access_token_env: str = DEFAULT_ACCESS_TOKEN_ENV,
+    beecount_refresh_token_env: str = DEFAULT_REFRESH_TOKEN_ENV,
+    beecount_limit: int = 500,
+    notice: dict | None = None,
+) -> str:
+    source = _resolve_beecount_source(
+        config_path,
+        beecount_input_json,
+        beecount_base_url,
+        beecount_ledger_id,
+        beecount_access_token_env,
+        beecount_refresh_token_env,
+        beecount_limit,
+    )
+    base_url = source["beecount_base_url"] or DEFAULT_BEECOUNT_BASE_URL
+    ledger_id = source["beecount_ledger_id"] or ""
+    access_env = source["beecount_access_token_env"] or DEFAULT_ACCESS_TOKEN_ENV
+    refresh_env = source["beecount_refresh_token_env"] or DEFAULT_REFRESH_TOKEN_ENV
+    limit = source["beecount_limit"] or 500
+    config_label = str(config_path) if config_path else "未配置"
+    access_status = _render_token_status("access token", token_is_configured(access_env))
+    refresh_status = _render_token_status("refresh token", token_is_configured(refresh_env))
+    mapping_rows_html = _render_beecount_mapping_rows(_fetch_beecount_category_mappings(db_path))
+    notice_html = _render_notice(notice)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BeeCount 连接配置</title>
+  <style>
+    :root {{
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #1f2933;
+      --muted: #6b7280;
+      --line: #d8dee8;
+      --green: #15803d;
+      --red: #b91c1c;
+      --blue: #1d4ed8;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    header {{
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }}
+    .wrap {{
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 24px;
+    }}
+    .topbar {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+    }}
+    h1 {{ margin: 0; font-size: 26px; }}
+    .back-link {{ color: var(--blue); font-weight: 700; text-decoration: none; }}
+    .panel {{
+      margin-top: 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 20px;
+    }}
+    .notice {{
+      margin-top: 18px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--green);
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 12px 14px;
+      font-weight: 700;
+    }}
+    .notice-failure {{ border-left-color: var(--red); }}
+    .status-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 0 0 18px;
+    }}
+    .token-status {{
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 10px;
+      font-size: 13px;
+      font-weight: 700;
+      background: #f8fafc;
+    }}
+    .token-status.good {{ color: var(--green); }}
+    .token-status.bad {{ color: var(--red); }}
+    form {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }}
+    label {{
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    input {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 10px 11px;
+      font: inherit;
+      color: var(--ink);
+      background: #fff;
+    }}
+    .wide {{ grid-column: 1 / -1; }}
+    .hint {{
+      grid-column: 1 / -1;
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.5;
+    }}
+    .mapping-list {{
+      display: grid;
+      gap: 10px;
+    }}
+    .mapping-row {{
+      display: grid;
+      grid-template-columns: minmax(150px, 1.2fr) 116px 170px minmax(92px, .7fr) minmax(92px, .7fr) 70px 66px;
+      gap: 8px;
+      align-items: center;
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }}
+    .mapping-source {{
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+    }}
+    .mapping-source strong, .mapping-source span {{
+      overflow-wrap: anywhere;
+    }}
+    .mapping-source span {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .mapping-enabled {{
+      display: flex;
+      gap: 5px;
+      align-items: center;
+      font-size: 12px;
+      color: var(--muted);
+    }}
+    .mapping-enabled input {{
+      width: auto;
+    }}
+    button {{
+      justify-self: start;
+      border: 0;
+      border-radius: 7px;
+      padding: 10px 14px;
+      background: var(--ink);
+      color: #fff;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+    code {{
+      overflow-wrap: anywhere;
+      color: var(--muted);
+    }}
+    @media (max-width: 760px) {{
+      .wrap {{ padding: 18px; }}
+      .topbar {{ align-items: flex-start; flex-direction: column; }}
+      form, .mapping-row {{ grid-template-columns: 1fr; }}
+      .wide {{ grid-column: auto; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap topbar">
+      <h1>BeeCount 连接配置</h1>
+      <a class="back-link" href="/">返回仪表盘</a>
+    </div>
+  </header>
+  <main class="wrap">
+    {notice_html}
+    <section class="panel">
+      <div class="status-row">
+        {access_status}
+        {refresh_status}
+      </div>
+      <form method="post" action="/actions/beecount-token-config">
+        <label class="wide">BeeCount base URL
+          <input name="base_url" value="{html.escape(str(base_url))}" required>
+        </label>
+        <label>Ledger ID
+          <input name="ledger_id" value="{html.escape(str(ledger_id))}" required>
+        </label>
+        <label>读取上限
+          <input name="limit" inputmode="numeric" value="{html.escape(str(limit))}" required>
+        </label>
+        <label>Access token 环境名
+          <input name="access_token_env" value="{html.escape(str(access_env))}" required>
+        </label>
+        <label>Refresh token 环境名
+          <input name="refresh_token_env" value="{html.escape(str(refresh_env))}" required>
+        </label>
+        <label class="wide">新的 access_token
+          <input type="password" name="access_token" autocomplete="off" placeholder="留空则不覆盖 Keychain 中已有值">
+        </label>
+        <label class="wide">新的 refresh_token
+          <input type="password" name="refresh_token" autocomplete="off" placeholder="留空则不覆盖 Keychain 中已有值">
+        </label>
+        <p class="hint">配置文件只保存连接参数：<code>{html.escape(config_label)}</code>。token 只写入 macOS Keychain，不写入仓库或 data 文件。</p>
+        <button type="submit">保存 BeeCount 配置</button>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>BeeCount 分类映射</h2>
+      <div class="mapping-list">
+        {mapping_rows_html}
+      </div>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
 def _render_options(options: list[tuple[str, str]], selected: str) -> str:
     parts = []
     for value, label in options:
         selected_attr = " selected" if value == selected else ""
         parts.append(f'<option value="{html.escape(value)}"{selected_attr}>{html.escape(label)}</option>')
     return "".join(parts)
+
+
+def _render_category_l2_picker(selected_l1: str = "", selected_l2: str = "", disabled: bool = False) -> str:
+    selected_l2 = selected_l2 or ""
+    preset_values = {category_l2 for _category_l1, category_l2 in CATEGORY_L2_PRESETS}
+    custom_value = selected_l2 if selected_l2 and selected_l2 not in preset_values else ""
+    parts = ['<option value="">选择明细</option>']
+    current_group = ""
+    for category_l1, category_l2 in CATEGORY_L2_PRESETS:
+        if category_l1 != current_group:
+            if current_group:
+                parts.append("</optgroup>")
+            current_group = category_l1
+            parts.append(f'<optgroup label="{html.escape(category_l1)}">')
+        value = _category_preset_value(category_l1, category_l2)
+        selected_attr = " selected" if category_l2 == selected_l2 else ""
+        parts.append(f'<option value="{html.escape(value)}"{selected_attr}>{html.escape(category_l2)}</option>')
+    if current_group:
+        parts.append("</optgroup>")
+    custom_selected = " selected" if custom_value else ""
+    disabled_attr = " disabled" if disabled else ""
+    parts.append(f'<option value="__custom__"{custom_selected}>自定义添加</option>')
+    return (
+        '<label class="category-picker">支出明细'
+        f'<select name="category_l2_preset"{disabled_attr}>{"".join(parts)}</select>'
+        f'<input type="text" name="category_l2_custom" value="{html.escape(custom_value)}" '
+        f'placeholder="自定义明细"{disabled_attr}>'
+        f'<input type="hidden" name="category_l1" value="{html.escape(selected_l1 or "")}">'
+        "</label>"
+    )
 
 
 def _render_review_transactions(rows: list[dict]) -> str:
@@ -675,6 +1369,7 @@ def _render_review_transactions(rows: list[dict]) -> str:
             "</div>"
             f'<select name="financial_type">{_render_options(FINANCIAL_TYPE_OPTIONS, row["effective_financial_type"])}</select>'
             f'<select name="cashflow_direction">{_render_options(DIRECTION_OPTIONS, row["effective_direction"])}</select>'
+            f'{_render_category_l2_picker(row.get("effective_category_l1") or "", row.get("effective_category_l2") or "")}'
             '<button type="submit">保存</button>'
             "</form>"
         )
@@ -691,8 +1386,7 @@ def _render_add_transaction_form() -> str:
         f'<label>类型<select name="financial_type">{_render_options(FINANCIAL_TYPE_OPTIONS, "living_expense")}</select></label>'
         '<label class="entry-wide">说明<input type="text" name="description" placeholder="午饭 外卖" required></label>'
         '<label>账户<input type="text" name="account" placeholder="可选"></label>'
-        '<label>一级分类<input type="text" name="category_l1" placeholder="可选"></label>'
-        '<label>二级分类<input type="text" name="category_l2" placeholder="可选"></label>'
+        f'{_render_category_l2_picker()}'
         '<button type="submit">记录</button>'
         "</form>"
     )
@@ -766,7 +1460,7 @@ def _render_recurring_forms() -> str:
         '<label>金额<input type="number" name="amount_yuan" min="0" step="0.01" placeholder="199" required></label>'
         f'<label>开始日期<input type="date" name="start_date" value="{html.escape(today)}" required></label>'
         '<label>扣款日<input type="number" name="day_of_month" min="1" max="31" step="1" placeholder="1" required></label>'
-        '<label>分类<input name="category_l2" placeholder="宽带 / 电话费" required></label>'
+        f'{_render_category_l2_picker("固定支出")}'
         '<label>账户<input name="account" placeholder="可选"></label>'
         '<label>结束日期<input type="date" name="end_date"></label>'
         '<button type="submit">保存账单</button>'
@@ -908,7 +1602,7 @@ def _render_template_edit_form(row: dict | None) -> str:
         f'<label>金额<input type="number" name="amount_yuan" min="0" step="0.01" value="{html.escape(amount)}" required{disabled}></label>'
         f'<label>开始日期<input type="date" name="start_date" value="{html.escape(row["start_date"] or "")}" required{disabled}></label>'
         f'<label>扣款日<input type="number" name="day_of_month" min="1" max="31" step="1" value="{int(row["day_of_month"])}" required{disabled}></label>'
-        f'<label>分类<input name="category_l2" value="{html.escape(row.get("category_l2") or "")}" required{disabled}></label>'
+        f'{_render_category_l2_picker("固定支出", row.get("category_l2") or "", disabled=bool(disabled))}'
         f'<label>账户<input name="account" value="{html.escape(row.get("account") or "")}"{disabled}></label>'
         f'<label>结束日期<input type="date" name="end_date" value="{html.escape(row.get("end_date") or "")}"{disabled}></label>'
         f'<button type="submit"{disabled}>保存修改</button>'
@@ -981,97 +1675,11 @@ def _render_debt_split_summary(summary: dict) -> str:
 
 
 def _build_financial_advice(data: dict) -> list[str]:
-    latest = data["latest_month"]
-    if not latest:
-        return ["先连续记录 7 天收入支出，系统才能给出可靠的日常现金流建议。"]
-
-    stable_income = int(latest["stable_income_cents"] or 0)
-    living = int(latest["living_expense_cents"] or 0)
-    fixed = int(latest["fixed_expense_cents"] or 0)
-    debt = int(latest["debt_payment_cents"] or 0)
-    net = int(latest["net_operating_cashflow_cents"] or 0)
-    unknown_count = int(data["unknown_count"] or 0)
-
-    advice = []
-    if stable_income == 0:
-        advice.append("本月还没有稳定收入记录，结余率暂时不能判断；先把工资或固定收入补齐。")
-    elif net < 0:
-        advice.append("本月基础结余为负，优先检查固定支出、债务还款和高频生活支出，先暂停非必要大额消费。")
-    elif net < stable_income * 0.1:
-        advice.append("本月基础结余低于稳定收入的 10%，抗风险空间偏薄，建议给日常消费设一个周预算。")
-    elif fixed + debt > stable_income * 0.5:
-        advice.append("本月基础结余为正，但固定支出和债务还款压力偏高，提前还贷或新增大额支出前先做模拟。")
-    else:
-        advice.append("本月基础结余为正，现金流结构暂时健康；继续保持实时记录，月底再看是否稳定。")
-
-    if stable_income and fixed + debt > stable_income * 0.5:
-        advice.append("固定支出加债务还款超过稳定收入的 50%，这部分是现金流压力核心。")
-    if stable_income and living > stable_income * 0.35:
-        advice.append("日常生活支出超过稳定收入的 35%，建议重点看餐饮、购物、交通这些高频项。")
-    if unknown_count:
-        advice.append(f"仍有 {unknown_count} 笔 unknown，建议当天补完分类，超过一周后可解释性会明显下降。")
-
-    return advice[:4]
+    return list(analyze_cashflow(data)["advice"])
 
 
 def _build_cashflow_signal(data: dict) -> dict[str, object]:
-    latest = data["latest_month"]
-    if not latest:
-        return {
-            "level": "watch",
-            "label": "观察状态",
-            "safety_months": None,
-            "headline": "当前家庭现金流：观察状态。先连续记录 7 天收入支出，再生成近期消费建议。",
-            "reason": "缺少月度现金流数据，系统还不能判断未来 30 天的大额支出风险。",
-        }
-
-    stable_income = int(latest["stable_income_cents"] or 0)
-    living = int(latest["living_expense_cents"] or 0)
-    fixed = int(latest["fixed_expense_cents"] or 0)
-    debt = int(latest["debt_payment_cents"] or 0)
-    net = int(latest["net_operating_cashflow_cents"] or 0)
-    unknown_count = int(data["unknown_count"] or 0)
-    pending_count = int(data["pending_count"] or 0)
-    required_outflow = fixed + debt
-    safety_months = round(net / required_outflow, 1) if required_outflow > 0 and net > 0 else 0.0
-
-    if stable_income <= 0 or net < 0:
-        level = "danger"
-        label = "危险状态"
-        action = "未来 30 天先暂停非必要大额消费，并优先补齐稳定收入、固定支出和债务记录。"
-    else:
-        net_ratio = net / stable_income
-        pressure_ratio = required_outflow / stable_income
-        living_ratio = living / stable_income
-        if net_ratio < 0.1 or pressure_ratio > 0.65:
-            level = "tight"
-            label = "偏紧状态"
-            action = "未来 30 天不建议新增大额支出，提前还贷和加仓投资都建议暂缓。"
-        elif net_ratio < 0.25 or pressure_ratio > 0.5 or living_ratio > 0.35:
-            level = "watch"
-            label = "观察状态"
-            action = "未来 30 天可以正常消费，但新增大额支出、提前还贷和加仓投资需要先做模拟。"
-        else:
-            level = "safe"
-            label = "安全状态"
-            action = "未来 30 天可维持正常消费；大额支出仍建议先确认不会把安全垫压到 1 个月以下。"
-
-    confidence_note = ""
-    if unknown_count or pending_count:
-        confidence_note = f" 当前仍有 {unknown_count} 笔 unknown、{pending_count} 笔 pending，建议可信度会下降。"
-
-    reason = (
-        f"本月基础结余 {_format_yuan(net)} 元，固定支出+债务还款 "
-        f"{_format_yuan(required_outflow)} 元，代理安全垫约 {safety_months:.1f} 个月。"
-        f"{confidence_note}"
-    )
-    return {
-        "level": level,
-        "label": label,
-        "safety_months": safety_months,
-        "headline": f"当前家庭现金流：{label}。{action}",
-        "reason": reason,
-    }
+    return analyze_cashflow(data)
 
 
 def _render_cashflow_signal(data: dict) -> str:
@@ -1084,11 +1692,17 @@ def _render_cashflow_signal(data: dict) -> str:
         safety_html = '<span class="signal-chip">安全垫：待计算</span>'
     else:
         safety_html = f'<span class="signal-chip">安全垫：{float(safety):.1f} 个月</span>'
+    confidence = html.escape(str(signal.get("confidence", "unknown")))
+    risk_30 = _format_yuan(int(signal.get("risk_next_30_cents") or 0))
+    risk_90 = _format_yuan(int(signal.get("risk_next_90_cents") or 0))
     return (
         f'<div class="cashflow-signal signal-{level}">'
         f"<strong>{headline}</strong>"
         f"<p>{reason}</p>"
         f"{safety_html}"
+        f'<span class="signal-chip">可信度：{confidence}</span>'
+        f'<span class="signal-chip">30天风险：{html.escape(risk_30)} 元</span>'
+        f'<span class="signal-chip">3个月风险：{html.escape(risk_90)} 元</span>'
         "</div>"
     )
 
@@ -1153,6 +1767,10 @@ def render_dashboard_html(
 
     unknown_count = data["unknown_count"]
     pending_count = data["pending_count"]
+    beecount_unknown_count = data["beecount_unknown_count"]
+    beecount_pending_count = data["beecount_pending_count"]
+    legacy_unknown_count = data["legacy_unknown_count"]
+    legacy_pending_count = data["legacy_pending_count"]
     trend_html = _render_trend_bars(data["trend"])
     pipeline_html = _render_pipeline_result(pipeline_result)
     notice_html = _render_notice(notice)
@@ -1235,6 +1853,21 @@ def render_dashboard_html(
       display: flex;
       gap: 10px;
       align-items: center;
+    }}
+    .secondary-action {{
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--ink);
+      background: #ffffff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 12px;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
     }}
     button {{
       min-height: 38px;
@@ -1422,6 +2055,13 @@ def render_dashboard_html(
       padding: 0 9px;
       width: 100%;
     }}
+    .category-picker {{
+      grid-template-columns: 1fr;
+    }}
+    .category-picker select,
+    .category-picker input {{
+      min-width: 0;
+    }}
     .entry-wide {{
       grid-column: span 2;
     }}
@@ -1571,9 +2211,9 @@ def render_dashboard_html(
     }}
     .review-row {{
       display: grid;
-      grid-template-columns: minmax(180px, 1fr) 160px 120px 72px;
+      grid-template-columns: minmax(180px, 1fr) 150px 108px minmax(170px, 0.8fr) 72px;
       gap: 8px;
-      align-items: center;
+      align-items: end;
       padding: 10px 0;
       border-top: 1px solid var(--line);
     }}
@@ -1678,6 +2318,7 @@ def render_dashboard_html(
     <div class="wrap topbar">
       <h1>家庭现金流雷达</h1>
       <div class="actions">
+        <a class="secondary-action" href="/settings/beecount">BeeCount 配置</a>
         <form method="post" action="/actions/refresh">
           <button type="submit">刷新数据</button>
         </form>
@@ -1733,10 +2374,12 @@ def render_dashboard_html(
         </div>
       </div>
       <div class="panel" id="review-panel">
-        <h2>分类审核</h2>
+        <h2>语义待处理</h2>
         <div class="review-list">
-          <div class="review-item warn"><span>unknown 待审核</span><strong>{unknown_count}</strong></div>
-          <div class="review-item"><span>pending 待审核</span><strong>{pending_count}</strong></div>
+          <div class="review-item warn"><span>BeeCount unknown</span><strong>{beecount_unknown_count}</strong></div>
+          <div class="review-item"><span>BeeCount pending</span><strong>{beecount_pending_count}</strong></div>
+          <div class="review-item warn"><span>历史 unknown</span><strong>{legacy_unknown_count}</strong></div>
+          <div class="review-item"><span>历史 pending</span><strong>{legacy_pending_count}</strong></div>
         </div>
         <div class="review-transactions">
           {review_transactions_html}
@@ -1773,9 +2416,33 @@ def render_dashboard_html(
 class DashboardHandler(BaseHTTPRequestHandler):
     db_path = DEFAULT_DB
     raw_input_path = DEFAULT_RAW_INPUT
+    beecount_config_path: Path | None = DEFAULT_BEECOUNT_CONFIG
+    beecount_input_json: Path | None = None
+    beecount_base_url: str | None = None
+    beecount_ledger_id: str | None = None
+    beecount_access_token_env = "BEECOUNT_ACCESS_TOKEN"
+    beecount_refresh_token_env = "BEECOUNT_REFRESH_TOKEN"
+    beecount_limit = 500
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/settings/beecount":
+            body = render_beecount_settings_html(
+                db_path=self.db_path,
+                config_path=self.beecount_config_path,
+                beecount_input_json=self.beecount_input_json,
+                beecount_base_url=self.beecount_base_url,
+                beecount_ledger_id=self.beecount_ledger_id,
+                beecount_access_token_env=self.beecount_access_token_env,
+                beecount_refresh_token_env=self.beecount_refresh_token_env,
+                beecount_limit=self.beecount_limit,
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path not in ("/", "/index.html"):
             self.send_error(404)
             return
@@ -1809,7 +2476,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/actions/refresh":
-            result = run_refresh_pipeline(self.db_path, self.raw_input_path)
+            result = run_refresh_pipeline(
+                self.db_path,
+                self.raw_input_path,
+                beecount_config_path=self.beecount_config_path,
+                beecount_input_json=self.beecount_input_json,
+                beecount_base_url=self.beecount_base_url,
+                beecount_ledger_id=self.beecount_ledger_id,
+                beecount_access_token_env=self.beecount_access_token_env,
+                beecount_refresh_token_env=self.beecount_refresh_token_env,
+                beecount_limit=self.beecount_limit,
+            )
             try:
                 body = render_dashboard_html(self.db_path, pipeline_result=result).encode("utf-8")
                 status = 200 if result["ok"] else 500
@@ -1888,6 +2565,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except sqlite3.Error as exc:
                 body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
                 status = 500
+        elif parsed.path == "/actions/beecount-token-config":
+            notice = self._handle_beecount_token_config()
+            body = render_beecount_settings_html(
+                db_path=self.db_path,
+                config_path=self.beecount_config_path,
+                beecount_input_json=self.beecount_input_json,
+                beecount_base_url=self.beecount_base_url,
+                beecount_ledger_id=self.beecount_ledger_id,
+                beecount_access_token_env=self.beecount_access_token_env,
+                beecount_refresh_token_env=self.beecount_refresh_token_env,
+                beecount_limit=self.beecount_limit,
+                notice=notice,
+            ).encode("utf-8")
+            status = 200 if notice["ok"] else 400
+        elif parsed.path == "/actions/beecount-category-mapping":
+            notice = self._handle_beecount_category_mapping()
+            body = render_beecount_settings_html(
+                db_path=self.db_path,
+                config_path=self.beecount_config_path,
+                beecount_input_json=self.beecount_input_json,
+                beecount_base_url=self.beecount_base_url,
+                beecount_ledger_id=self.beecount_ledger_id,
+                beecount_access_token_env=self.beecount_access_token_env,
+                beecount_refresh_token_env=self.beecount_refresh_token_env,
+                beecount_limit=self.beecount_limit,
+                notice=notice,
+            ).encode("utf-8")
+            status = 200 if notice["ok"] else 400
         else:
             self.send_error(404)
             return
@@ -1906,18 +2611,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             transaction_id = int(fields.get("transaction_id", [""])[0])
         except ValueError:
             return {"ok": False, "message": "交易 ID 无效"}
+        category_l1, category_l2 = _resolve_category_fields(fields)
 
         return save_manual_override(
             self.db_path,
             transaction_id,
             fields.get("financial_type", [""])[0],
             fields.get("cashflow_direction", [""])[0],
+            category_l1=category_l1,
+            category_l2=category_l2,
         )
 
     def _handle_add_transaction(self) -> dict:
         content_length = int(self.headers.get("Content-Length", "0") or 0)
         raw_body = self.rfile.read(content_length).decode("utf-8")
         fields = parse_qs(raw_body)
+        category_l1, category_l2 = _resolve_category_fields(fields)
         return save_new_transaction(
             self.db_path,
             fields.get("transaction_date", [""])[0],
@@ -1926,8 +2635,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             fields.get("financial_type", [""])[0],
             fields.get("description", [""])[0],
             account=fields.get("account", [""])[0],
-            category_l1=fields.get("category_l1", [""])[0],
-            category_l2=fields.get("category_l2", [""])[0],
+            category_l1=category_l1,
+            category_l2=category_l2,
         )
 
     def _handle_add_mortgage_template(self) -> dict:
@@ -1950,13 +2659,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0") or 0)
         raw_body = self.rfile.read(content_length).decode("utf-8")
         fields = parse_qs(raw_body)
+        _category_l1, category_l2 = _resolve_category_fields(fields)
         return save_fixed_bill_template(
             self.db_path,
             fields.get("name", [""])[0],
             fields.get("amount_yuan", [""])[0],
             fields.get("start_date", [""])[0],
             fields.get("day_of_month", [""])[0],
-            fields.get("category_l2", [""])[0],
+            category_l2,
             account=fields.get("account", [""])[0],
             end_date=fields.get("end_date", [""])[0],
         )
@@ -1982,6 +2692,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0") or 0)
         raw_body = self.rfile.read(content_length).decode("utf-8")
         fields = parse_qs(raw_body)
+        _category_l1, category_l2 = _resolve_category_fields(fields)
         return update_saved_fixed_bill_template(
             self.db_path,
             fields.get("template_id", [""])[0],
@@ -1989,7 +2700,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             fields.get("amount_yuan", [""])[0],
             fields.get("start_date", [""])[0],
             fields.get("day_of_month", [""])[0],
-            fields.get("category_l2", [""])[0],
+            category_l2,
             account=fields.get("account", [""])[0],
             end_date=fields.get("end_date", [""])[0],
         )
@@ -2026,17 +2737,87 @@ class DashboardHandler(BaseHTTPRequestHandler):
         fields = parse_qs(raw_body)
         return run_recurring_generation(self.db_path, fields.get("as_of", [""])[0])
 
+    def _handle_beecount_token_config(self) -> dict:
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        raw_body = self.rfile.read(content_length).decode("utf-8")
+        fields = parse_qs(raw_body)
+        return save_beecount_token_config(
+            self.beecount_config_path,
+            fields.get("base_url", [""])[0],
+            fields.get("ledger_id", [""])[0],
+            fields.get("limit", ["500"])[0],
+            access_token=fields.get("access_token", [""])[0],
+            refresh_token=fields.get("refresh_token", [""])[0],
+            access_token_env=fields.get("access_token_env", [DEFAULT_ACCESS_TOKEN_ENV])[0],
+            refresh_token_env=fields.get("refresh_token_env", [DEFAULT_REFRESH_TOKEN_ENV])[0],
+        )
+
+    def _handle_beecount_category_mapping(self) -> dict:
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        raw_body = self.rfile.read(content_length).decode("utf-8")
+        fields = parse_qs(raw_body)
+        return save_beecount_category_mapping(
+            self.db_path,
+            fields.get("mapping_id", [""])[0],
+            fields.get("cashflow_direction", [""])[0],
+            fields.get("financial_type", [""])[0],
+            fields.get("category_l1", [""])[0],
+            fields.get("category_l2", [""])[0],
+            fields.get("enabled", ["0"])[0],
+        )
+
     def log_message(self, format: str, *args) -> None:
         return
 
 
-def run_server(db_path: Path, host: str = "127.0.0.1", port: int = 8000, input_path: Path = DEFAULT_RAW_INPUT) -> None:
+def run_server(
+    db_path: Path,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    input_path: Path = DEFAULT_RAW_INPUT,
+    beecount_config_path: Path | None = DEFAULT_BEECOUNT_CONFIG,
+    beecount_input_json: Path | None = None,
+    beecount_base_url: str | None = None,
+    beecount_ledger_id: str | None = None,
+    beecount_access_token_env: str = "BEECOUNT_ACCESS_TOKEN",
+    beecount_refresh_token_env: str = "BEECOUNT_REFRESH_TOKEN",
+    beecount_limit: int = 500,
+) -> None:
     DashboardHandler.db_path = db_path
     DashboardHandler.raw_input_path = input_path
+    DashboardHandler.beecount_config_path = beecount_config_path
+    DashboardHandler.beecount_input_json = beecount_input_json
+    DashboardHandler.beecount_base_url = beecount_base_url
+    DashboardHandler.beecount_ledger_id = beecount_ledger_id
+    DashboardHandler.beecount_access_token_env = beecount_access_token_env
+    DashboardHandler.beecount_refresh_token_env = beecount_refresh_token_env
+    DashboardHandler.beecount_limit = beecount_limit
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print(f"Using database: {db_path}")
-    print(f"Using CSV input: {input_path}")
+    beecount_source = _resolve_beecount_source(
+        beecount_config_path,
+        beecount_input_json,
+        beecount_base_url,
+        beecount_ledger_id,
+        beecount_access_token_env,
+        beecount_refresh_token_env,
+        beecount_limit,
+    )
+    if _beecount_source_configured(
+        beecount_source["beecount_input_json"],
+        beecount_source["beecount_base_url"],
+        beecount_source["beecount_ledger_id"],
+    ):
+        if beecount_source["beecount_input_json"]:
+            print(f"Using BeeCount JSON: {beecount_source['beecount_input_json']}")
+        else:
+            print(
+                f"Using BeeCount API: {beecount_source['beecount_base_url']} "
+                f"ledger={beecount_source['beecount_ledger_id']}"
+            )
+    else:
+        print(f"Using CSV input: {input_path}")
     server.serve_forever()
 
 
@@ -2044,10 +2825,29 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="启动家庭现金流雷达 Web 仪表盘")
     parser.add_argument("--db", default=str(DEFAULT_DB), help="SQLite 数据库路径")
     parser.add_argument("--input", default=str(DEFAULT_RAW_INPUT), help="CSV 文件或目录路径")
+    parser.add_argument("--beecount-config", default=str(DEFAULT_BEECOUNT_CONFIG), help="BeeCount 本地只读来源配置 JSON")
+    parser.add_argument("--beecount-input-json", help="BeeCount transactions/items JSON 文件")
+    parser.add_argument("--beecount-base-url", default=str(DEFAULT_BEECOUNT_BASE_URL), help="BeeCount Cloud read API base URL")
+    parser.add_argument("--beecount-ledger-id", default="", help="BeeCount ledger id / external id")
+    parser.add_argument("--beecount-access-token-env", default="BEECOUNT_ACCESS_TOKEN", help="BeeCount access token 环境变量名")
+    parser.add_argument("--beecount-refresh-token-env", default="BEECOUNT_REFRESH_TOKEN", help="BeeCount refresh token 环境变量名")
+    parser.add_argument("--beecount-limit", type=int, default=500, help="BeeCount read API 单次读取上限")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址")
     parser.add_argument("--port", type=int, default=8000, help="监听端口")
     args = parser.parse_args()
-    run_server(Path(args.db), host=args.host, port=args.port, input_path=Path(args.input))
+    run_server(
+        Path(args.db),
+        host=args.host,
+        port=args.port,
+        input_path=Path(args.input),
+        beecount_config_path=Path(args.beecount_config) if args.beecount_config else None,
+        beecount_input_json=Path(args.beecount_input_json) if args.beecount_input_json else None,
+        beecount_base_url=args.beecount_base_url or None,
+        beecount_ledger_id=args.beecount_ledger_id or None,
+        beecount_access_token_env=args.beecount_access_token_env,
+        beecount_refresh_token_env=args.beecount_refresh_token_env,
+        beecount_limit=args.beecount_limit,
+    )
 
 
 if __name__ == "__main__":

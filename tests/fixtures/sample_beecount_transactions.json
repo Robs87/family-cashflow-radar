@@ -1,0 +1,34 @@
+{
+  "ledger_id": "ledger_family_demo",
+  "transactions": [
+    {
+      "sync_id": "bc_tx_income_001",
+      "tx_type": "income",
+      "amount": "20000.00",
+      "happened_at": "2026-05-01T09:00:00+08:00",
+      "category_name": "工资",
+      "account_name": "招商银行",
+      "note": "五月工资",
+      "tags_list": ["稳定收入"]
+    },
+    {
+      "syncId": "bc_tx_expense_001",
+      "type": "expense",
+      "amount": 68.5,
+      "happenedAt": "2026-05-02T12:30:00+08:00",
+      "categoryName": "餐饮",
+      "accountName": "招商银行",
+      "note": "午饭",
+      "tags": ["日常"]
+    },
+    {
+      "sync_id": "bc_tx_transfer_001",
+      "tx_type": "transfer",
+      "amount": "5000",
+      "happened_at": "2026-05-03T18:30:00+08:00",
+      "from_account_name": "招商银行",
+      "to_account_name": "交通银行",
+      "note": "账户互转"
+    }
+  ]
+}

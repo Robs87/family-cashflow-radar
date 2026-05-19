@@ -1,7 +1,7 @@
 ---
 title: 项目日志
 created: 2026-05-15
-updated: 2026-05-15
+updated: 2026-05-18
 type: log
 ---
 
@@ -30,9 +30,18 @@ type: log
 - 明确记录颗粒度按家庭现金流语义设计，最小可用类型包括稳定收入、日常支出、固定刚性支出、债务还款、投资流入/流出、内部转账、工作垫付/报销、大额资产/一次性事件。
 - 新增 `docs/prd/prd-v0.2.md`、`docs/plans/v0.2-action-advice-plan.md` 和 `docs/logs/2026-05-17-v0.2-update-summary.md`，作为后续 v0.2 施工依据。
 
+## 2026-05-18
+
+- 根据用户最新需求，项目分层调整为：BeeCount Cloud 作为流水记录层，Family Cashflow Radar 作为家庭现金流分析和决策层。
+- 明确本项目不再把日常记账体验作为主战场；BeeCount / BeeCount Cloud 负责移动端/Web 记录、多端同步、账户、分类、标签、预算、附件和基础图表。
+- 明确本项目负责 BeeCount 流水镜像、现金流语义、规则分类、月度现金流、家庭安全垫、近期建议和决策模拟。
+- BeeCount Cloud 接入默认只读，优先评估 MCP read tools、read API 和离线 SQLite/备份导入；写回 BeeCount 必须另行设计权限、审计和冲突处理。
+- 新增 `docs/plans/v0.3-beecount-cloud-source-plan.md`，并同步更新 `README.md`、`AGENTS.md`、`docs/prd/prd-v0.2.md`、`docs/plans/v0.2-action-advice-plan.md`。
+
 ## 待办
 
-- 统一对话式记录和 Web 手动输入的新增交易服务。
+- 实现 BeeCount Cloud 只读数据源适配。
+- 把 BeeCount 交易幂等同步到本地 raw/normalized 分析库。
 - 补齐工作垫付、报销、投资、债务、资产事件的记录语义和分类规则。
 - 完善固定账单、房贷计划、提前还贷事件的自动生成和编辑。
 - 实现首页一句现金流安全判断和近期行动建议。

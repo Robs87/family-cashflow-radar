@@ -21,6 +21,39 @@ MONTHLY_COLUMNS = {
 }
 
 
+def _ensure_beecount_mapping_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS beecount_category_mappings (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               beecount_kind TEXT NOT NULL CHECK(beecount_kind IN ('expense', 'income', 'transfer')),
+               category_name TEXT NOT NULL,
+               parent_name TEXT DEFAULT '',
+               level INTEGER DEFAULT 1,
+               radar_cashflow_direction TEXT NOT NULL CHECK(radar_cashflow_direction IN ('inflow', 'outflow', 'neutral')),
+               radar_financial_type TEXT NOT NULL CHECK(radar_financial_type IN (
+                   'stable_income', 'one_time_income', 'living_expense', 'fixed_expense',
+                   'debt_payment', 'debt_inflow', 'asset_purchase', 'asset_sale',
+                   'investment_outflow', 'investment_inflow', 'internal_transfer',
+                   'credit_card_payment', 'refund', 'reimbursable_expense',
+                   'reimbursement_income', 'historical_debt_asset_event', 'unknown'
+               )),
+               radar_category_l1 TEXT DEFAULT '',
+               radar_category_l2 TEXT DEFAULT '',
+               confidence REAL DEFAULT 1.0,
+               enabled INTEGER DEFAULT 1,
+               mapping_source TEXT DEFAULT 'inferred',
+               notes TEXT DEFAULT '',
+               created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+               updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(beecount_kind, category_name, parent_name)
+           )"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_beecount_category_mappings_lookup
+           ON beecount_category_mappings(beecount_kind, category_name, enabled)"""
+    )
+
+
 def _table_sql(conn: sqlite3.Connection, table: str) -> str:
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -119,6 +152,18 @@ def _ensure_v02_rules(conn: sqlite3.Connection) -> None:
         return
     conn.execute(
         """UPDATE classification_rules
+           SET condition_json = '{"any_text_contains": ["转账", "账户转账", "账户互转", "余额宝转入", "余额宝转出", "微信零钱", "支付宝余额", "银行卡转入", "银行卡转出", "提现", "充值"]}'
+           WHERE rule_name = 'internal_transfer'
+             AND condition_json NOT LIKE '%账户互转%'"""
+    )
+    conn.execute(
+        """UPDATE classification_rules
+           SET condition_json = '{"any_text_contains": ["信用卡还款", "还信用卡", "信用卡自动还款", "账单还款", "购汇还款"]}'
+           WHERE rule_name = 'credit_card_payment'
+             AND condition_json NOT LIKE '%购汇还款%'"""
+    )
+    conn.execute(
+        """UPDATE classification_rules
            SET condition_json = '{"any_text_contains": ["借款", "借入", "借钱", "周转", "亲友借款", "贷款到账"], "direction_in": ["收入", "in"]}'
            WHERE rule_name = 'debt_inflow'"""
     )
@@ -127,6 +172,12 @@ def _ensure_v02_rules(conn: sqlite3.Connection) -> None:
            SET condition_json = '{"any_text_contains": ["奖金", "年终奖", "补贴", "红包", "礼金", "临时收入"]}',
                description = '一次性收入（奖金、补贴、红包等）'
            WHERE rule_name = 'one_time_income'"""
+    )
+    conn.execute(
+        """UPDATE classification_rules
+           SET condition_json = '{"any_text_contains": ["餐饮", "早餐", "午餐", "晚餐", "夜宵", "外卖", "超市", "购物", "交通", "打车", "地铁", "加油", "停车", "娱乐", "电影", "旅游", "医疗", "药品", "理发", "快递"]}'
+           WHERE rule_name = 'living_expense'
+             AND condition_json NOT LIKE '%早餐%'"""
     )
     _insert_rule_if_missing(
         conn,
@@ -144,13 +195,25 @@ def _ensure_v02_rules(conn: sqlite3.Connection) -> None:
         conn,
         "reimbursement_income",
         56,
-        '{"any_text_contains": ["报销到账", "公司报销", "报销款", "报销入账", "垫付报销"], "direction_in": ["收入", "in"]}',
+        '{"any_text_contains": ["报销", "其他报销", "报销到账", "公司报销", "报销款", "报销入账", "垫付报销"], "direction_in": ["收入", "in"]}',
         "inflow",
         "reimbursement_income",
         "垫付报销",
         "报销回款",
         0.9,
         "工作垫付回款，不算稳定收入",
+    )
+    conn.execute(
+        """UPDATE classification_rules
+           SET condition_json = '{"any_text_contains": ["报销", "其他报销", "报销到账", "公司报销", "报销款", "报销入账", "垫付报销"], "direction_in": ["收入", "in"]}'
+           WHERE rule_name = 'reimbursement_income'
+             AND condition_json NOT LIKE '%其他报销%'"""
+    )
+    conn.execute(
+        """UPDATE classification_rules
+           SET condition_json = '{"any_text_contains": ["房租", "物业费", "水电费", "燃气费", "暖气费", "保险费", "社保", "公积金", "话费", "宽带", "学费", "培训费", "幼儿园"]}'
+           WHERE rule_name = 'fixed_expense'
+             AND condition_json NOT LIKE '%培训费%'"""
     )
 
 
@@ -183,6 +246,7 @@ def ensure_v02_schema(conn: sqlite3.Connection) -> None:
                 _rebuild_table(conn, table)
 
         _ensure_monthly_columns(conn)
+        _ensure_beecount_mapping_table(conn)
         _ensure_v02_rules(conn)
         _ensure_indexes(conn)
     finally:

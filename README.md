@@ -1,10 +1,10 @@
 # 家庭现金流雷达
 
-> 本地 Web App + SQLite + CSV 导入 + 自动分类 + 现金流仪表盘。
+> BeeCount Cloud 流水记录层 + 本地家庭现金流分析和决策系统。
 
 ## 项目目标
 
-这个项目不是重新做一个记账 App，而是把多年貔貅记账流水翻译成家庭财务决策系统。
+这个项目不再重新做日常记账 App。BeeCount / BeeCount Cloud 负责流水记录、移动端录入、多端同步、账户、分类、预算和基础账本管理；本项目负责把账本流水翻译成家庭财务决策系统。
 
 第一版只回答 6 个问题：
 
@@ -15,23 +15,81 @@
 5. 大额决策能不能做。
 6. 如果不能，差多少钱、要等到什么时候。
 
-## 当前技术路线
+## 当前产品分层
 
-- 本地运行，不上云。
-- SQLite 保存清洗后的账本与模型结果。
-- CSV 从貔貅记账导出。
-- 分类采用规则优先，AI 后置。
-- 先 CLI 跑通模型，再做 Web 仪表盘。
+- BeeCount Cloud：流水记录层，负责 iOS / Android / Web 记录、同步、备份、附件、账户、分类和预算。
+- Family Cashflow Radar：分析决策层，负责现金流语义、规则分类、月度现金流、家庭安全垫、建议和决策模拟。
+- 本地 SQLite：只保存分析所需的原始镜像、标准化结果、人工覆盖、预测、建议和模拟结果。
+- CSV 导入：保留为历史账本迁移和兜底通道，不再作为长期日常记录入口。
+- 分类和建议：规则优先，AI 后置，所有结论必须可解释。
+
+BeeCount Cloud 当前可作为数据源的候选路径：
+
+1. MCP 只读工具：读取账本、交易、账户、分类、预算和统计。
+2. BeeCount Cloud read API：从服务端 projection 读取交易和工作区数据，需要普通 access token，不能用 `bcmcp_...` MCP PAT。
+3. BeeCount Cloud SQLite / 备份离线导入：用于本地批量同步和灾难恢复分析。
+
+默认策略是只读消费 BeeCount 数据。除非用户明确授权，本项目不向 BeeCount Cloud 写交易。
+
+当前 BeeCount Cloud NAS 地址：
+
+```text
+https://bee.332626.xyz:9090
+```
 
 ## 日常使用
 
-把貔貅记账导出的 CSV 放进 `data/raw/`，然后启动本地仪表盘：
+短期仍可用现有本地仪表盘查看分析结果：
 
 ```bash
 python3 app/main.py --db data/processed/cashflow.db --input data/raw
 ```
 
-浏览器打开命令行显示的本地地址，点击页面右上角的“刷新数据”即可导入 CSV、标准化、分类并生成月度现金流。
+浏览器打开命令行显示的本地地址。未配置 BeeCount 来源时，“刷新数据”仍走本仓库已有 CSV/本地数据闭环；配置 BeeCount 来源后，会优先执行 BeeCount 同步，再标准化、分类并生成月度现金流。
+
+首选使用 BeeCount Cloud read API 作为只读来源：
+
+```bash
+export BEECOUNT_ACCESS_TOKEN=...
+export BEECOUNT_REFRESH_TOKEN=...
+python3 app/main.py \
+  --db data/processed/cashflow.db \
+  --beecount-base-url https://bee.332626.xyz:9090 \
+  --beecount-ledger-id <ledger-id>
+```
+
+也可以把 read API 来源保存成本地配置文件，之后启动 Web 不需要每次传 BeeCount 参数。配置文件放在 `data/processed/beecount_source.json`，该目录已被 `.gitignore` 忽略，不要在里面保存 token 原文。
+
+```json
+{
+  "base_url": "https://bee.332626.xyz:9090",
+  "ledger_id": "1",
+  "access_token_env": "BEECOUNT_ACCESS_TOKEN",
+  "refresh_token_env": "BEECOUNT_REFRESH_TOKEN",
+  "limit": 500
+}
+```
+
+`access_token` 缺失或过期时，同步器会用 `refresh_token` 调用 BeeCount `/api/v1/auth/refresh` 自动换新，并在当前进程环境里更新两枚 token。不要把 token 原文写进配置文件。
+
+BeeCount JSON 导出或 MCP 查询结果只作为离线兜底来源：
+
+```bash
+python3 app/main.py \
+  --db data/processed/cashflow.db \
+  --beecount-input-json /path/to/beecount-transactions.json
+```
+
+对应的本地配置写法：
+
+```json
+{
+  "input_json": "beecount_latest.json",
+  "ledger_id": "1"
+}
+```
+
+此时 `input_json` 相对路径按配置文件所在目录解析，即上例会读取 `data/processed/beecount_latest.json`。
 
 也可以继续使用 CLI 链路：
 
@@ -61,6 +119,7 @@ python3 app/scripts/print_summary.py --db data/processed/cashflow.db
 
 - [PRD v0.1](docs/prd/prd-v0.1.md)
 - [PRD v0.2](docs/prd/prd-v0.2.md)
+- [BeeCount Cloud 数据源适配计划 v0.3](docs/plans/v0.3-beecount-cloud-source-plan.md)
 - [数据库 Schema 与自动分类规则 v0.1](docs/design/database-schema-and-classification-rules-v0.1.md)
 - [MVP 实施计划 v0.1](docs/plans/mvp-implementation-plan-v0.1.md)
 - [v0.2 实施计划](docs/plans/v0.2-action-advice-plan.md)

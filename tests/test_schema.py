@@ -10,6 +10,7 @@ EXPECTED_TABLES = {
     "raw_transactions",
     "normalized_transactions",
     "classification_rules",
+    "beecount_category_mappings",
     "monthly_cashflow",
     "asset_events",
     "debts",
@@ -183,6 +184,20 @@ def test_classification_rules_condition_json_is_text(db_conn):
     cols = _get_column_types(db_conn, "classification_rules")
     assert "condition_json" in cols
     assert cols["condition_json"] == "TEXT"
+
+
+def test_beecount_category_mappings_has_semantic_fields(db_conn):
+    cols = _get_column_types(db_conn, "beecount_category_mappings")
+    for field in [
+        "beecount_kind",
+        "category_name",
+        "parent_name",
+        "radar_cashflow_direction",
+        "radar_financial_type",
+        "radar_category_l1",
+        "radar_category_l2",
+    ]:
+        assert field in cols
 
 
 # --- seed rules ---

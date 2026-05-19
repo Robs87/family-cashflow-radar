@@ -128,6 +128,37 @@ CREATE INDEX IF NOT EXISTS idx_rules_priority ON classification_rules(priority);
 CREATE INDEX IF NOT EXISTS idx_rules_enabled_priority ON classification_rules(enabled, priority);
 
 -- ============================================================
+-- 3.1. beecount_category_mappings: BeeCount 分类到现金流语义
+-- ============================================================
+CREATE TABLE IF NOT EXISTS beecount_category_mappings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    beecount_kind TEXT NOT NULL CHECK(beecount_kind IN ('expense', 'income', 'transfer')),
+    category_name TEXT NOT NULL,
+    parent_name TEXT DEFAULT '',
+    level INTEGER DEFAULT 1,
+    radar_cashflow_direction TEXT NOT NULL CHECK(radar_cashflow_direction IN ('inflow', 'outflow', 'neutral')),
+    radar_financial_type TEXT NOT NULL CHECK(radar_financial_type IN (
+        'stable_income', 'one_time_income', 'living_expense', 'fixed_expense',
+        'debt_payment', 'debt_inflow', 'asset_purchase', 'asset_sale',
+        'investment_outflow', 'investment_inflow', 'internal_transfer',
+        'credit_card_payment', 'refund', 'reimbursable_expense',
+        'reimbursement_income', 'historical_debt_asset_event', 'unknown'
+    )),
+    radar_category_l1 TEXT DEFAULT '',
+    radar_category_l2 TEXT DEFAULT '',
+    confidence REAL DEFAULT 1.0,
+    enabled INTEGER DEFAULT 1,
+    mapping_source TEXT DEFAULT 'inferred',
+    notes TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(beecount_kind, category_name, parent_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_beecount_category_mappings_lookup
+    ON beecount_category_mappings(beecount_kind, category_name, enabled);
+
+-- ============================================================
 -- 4. monthly_cashflow: 月度现金流
 -- ============================================================
 CREATE TABLE IF NOT EXISTS monthly_cashflow (

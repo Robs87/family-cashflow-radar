@@ -246,6 +246,48 @@ class TestRuleClassification:
         assert reimbursement["financial_type"] != "stable_income"
         assert reimbursement["financial_type"] != "one_time_income"
 
+    def test_beecount_credit_card_fx_payment_and_meal_categories(self, db_path, tmp_path):
+        csv_path = tmp_path / "beecount_categories.csv"
+        csv_path.write_text(
+            "时间,金额,类型,账户,分类,子分类,商户,备注\n"
+            "2025-08-02 10:00:00,1899.73,支出,信用卡,购汇还款,,,\n"
+            "2026-05-18 08:00:00,4.00,支出,微信,早餐,,,早餐\n",
+            encoding="utf-8",
+        )
+        import_csv(db_path, csv_path)
+        normalize(db_path)
+        classify(db_path)
+        rows = _fetch_normalized(db_path)
+
+        fx_payment = _row_by_text(rows, "购汇还款")
+        assert fx_payment["financial_type"] == "credit_card_payment"
+        assert fx_payment["cashflow_direction"] == "neutral"
+
+        breakfast = _row_by_text(rows, "早餐")
+        assert breakfast["financial_type"] == "living_expense"
+        assert breakfast["cashflow_direction"] == "outflow"
+
+    def test_beecount_reimbursement_and_training_categories(self, db_path, tmp_path):
+        csv_path = tmp_path / "beecount_new_categories.csv"
+        csv_path.write_text(
+            "时间,金额,类型,账户,分类,子分类,商户,备注\n"
+            "2026-05-18 10:00:00,52.00,收入,微信,其他报销,,,微信\n"
+            "2026-05-18 11:00:00,2100.00,支出,招商银行,培训费,,,大提琴培训\n",
+            encoding="utf-8",
+        )
+        import_csv(db_path, csv_path)
+        normalize(db_path)
+        classify(db_path)
+        rows = _fetch_normalized(db_path)
+
+        reimbursement = next(row for row in rows if row["amount_cents"] == 5200)
+        assert reimbursement["financial_type"] == "reimbursement_income"
+        assert reimbursement["cashflow_direction"] == "inflow"
+
+        training = next(row for row in rows if row["amount_cents"] == 210000)
+        assert training["financial_type"] == "fixed_expense"
+        assert training["cashflow_direction"] == "outflow"
+
 
 class TestManualOverride:
     def test_manual_financial_type_not_overwritten(self, db_with_edge_normalized):
