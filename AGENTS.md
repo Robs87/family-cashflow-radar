@@ -1,54 +1,35 @@
 # 家庭现金流雷达 - Agent 施工规则
 
-本仓库是用户的本地家庭现金流计划、预测和决策项目。
+本仓库是用户的本地家庭现金流分析项目。最新目标是把 BeeCount Cloud 作为流水记录和同步层，本项目负责把账本流水翻译成家庭现金流分析和决策系统。
 
 ## 0. 核心边界
 
 代码施工默认交给 Claude Code。其他代理可以评审、QA、整理文档，但仓库代码改动必须遵守本文件。
 
-当前 v0.2 主线：
+当前产品分层：
 
 ```text
-BeeCount Cloud MCP 读取已发生流水
-→ 本地只读分析缓存
-→ 未来计划事件
-→ 房贷 / 周期义务展开
-→ 已发生流水 + 未来计划合并预测
-→ CLI 摘要
-→ 最简 Web 仪表盘
-→ AI 分析和预警
+BeeCount / BeeCount Cloud 负责记录、同步、附件、账户、分类、预算和基础图表
+Family Cashflow Radar 负责读取 BeeCount 流水、标准化现金流语义、规则分类、月度现金流、预测、建议和决策模拟
 ```
-
-职责分工：
-
-```text
-BeeCount Cloud：日常记账事实源，负责已发生交易、账户、分类、标签、预算等基础账本能力。
-家庭现金流雷达：不重复记账，只维护 BeeCount 缺失的未来计划、房贷计划、周期义务、提前关联记录、预测和决策模拟。
-```
-
-第一阶段只做：
-
-- BeeCount MCP 读取和同步缓存。
-- 计划事件管理。
-- 房贷 / 贷款计划管理。
-- 周期义务展开。
-- 计划事件与 BeeCount 实际流水匹配。
-- 未来现金流预测。
-- CLI 摘要。
-- CLI 闭环后再做最简 Web 仪表盘。
 
 不要做：
 
-- 重做 BeeCount Cloud 的日常记账录入。
-- 重做 BeeCount Cloud 的账户、分类、标签、预算基础管理。
-- 手机原生 App。
-- 多用户。
-- 登录权限系统。
-- 银行/微信/支付宝自动连接。
-- AI 自动分类主导。
-- AI 静默修改 BeeCount 事实流水。
-- 复杂图表。
-- CLI 数据闭环前的完整 Web UI。
+- 手机原生 App
+- 自建一套与 BeeCount 重叠的日常记账 App
+- 自建账本云同步
+- 多用户
+- 登录权限系统
+- 银行/微信/支付宝自动连接
+- AI 自动分类主导
+- 复杂图表
+
+允许做：
+
+- BeeCount Cloud 数据源适配。
+- BeeCount Cloud MCP / API / SQLite 备份只读导入。
+- CSV 导入作为历史迁移和兜底通道。
+- 本地分析库保存标准化结果、人工覆盖、预测、建议和决策模拟结果。
 
 ## 1. 隐私与数据安全
 
@@ -56,32 +37,25 @@ BeeCount Cloud：日常记账事实源，负责已发生交易、账户、分类
 
 严禁提交：
 
-- `data/raw/*` 中的真实导出数据。
-- `data/processed/*` 中的 SQLite 数据库。
-- BeeCount MCP 返回的真实流水 payload 导出。
-- 任何包含真实收入、支出、账户、商户、备注的文件。
-- 任何密钥、token、cookie、账户凭证。
+- `data/raw/*` 中的真实 CSV
+- `data/processed/*` 中的 SQLite 数据库
+- BeeCount Cloud 数据库、备份、附件或导出文件
+- 任何包含真实收入、支出、账户、商户、备注的导出文件
+- 任何密钥、token、cookie、账户凭证、BeeCount Cloud PAT
 
 `.gitignore` 已忽略 data 目录中的真实数据。不要绕过。
 
-测试必须使用 synthetic fixtures 或 mock MCP 返回，不要用真实账本写测试断言。
+测试必须使用 `tests/fixtures/` 下的合成假账本，不要用真实账本写测试断言。
 
 ## 2. 金额语义硬规则
 
-所有标准化、计划、预测和模拟中的金额字段必须用整数分：
+所有标准化和聚合后的金额字段必须用整数分：
 
 ```text
-*_cents INTEGER
+amount_cents INTEGER
 ```
 
-禁止在标准化表、计划表、月度表、预测表和模拟表里用 SQLite `REAL` 保存钱。
-
-利率用基点表示：
-
-```text
-annual_interest_rate_bps INTEGER
-3.45% = 345
-```
+禁止在标准化表、月度表、预测表和模拟表里用 SQLite `REAL` 保存钱。
 
 `amount_cents` 永远是非负绝对值。方向只能由 `cashflow_direction` 表达：
 
@@ -99,61 +73,85 @@ neutral  内部流转，不计入真实收支
 信用卡还款 5000 元 → amount_cents=500000, cashflow_direction=neutral
 ```
 
-BeeCount MCP 原始 payload 必须保留在缓存表中，便于追溯。
+原始金额必须保留在 `raw_transactions`，例如：
 
-## 3. 数据事实源规则
+```text
+amount_original
+income_amount_original
+expense_amount_original
+raw_payload
+```
 
-BeeCount Cloud 是已发生流水事实源。
+真实计算只使用 normalized 后的 cents 字段。
 
-家庭现金流雷达可以建立本地缓存，但本地缓存只用于分析，不得成为新的记账事实源。
-
-必须满足：
-
-- 读取 BeeCount 交易时保留 BeeCount 原始交易 ID。
-- 重复同步同一 BeeCount 交易不得重复插入。
-- 已发生流水以 BeeCount Cloud 为准。
-- 未来计划事件由家庭现金流雷达维护。
-- 计划事件不得伪装成 BeeCount 已发生流水。
-- 计划事件和实际 BeeCount 流水匹配后，预测时不得重复计算。
-
-## 4. 幂等性要求
+## 3. 幂等性要求
 
 所有脚本必须可重复运行，不得重复计数。
 
 必须满足：
 
-- 重复同步 BeeCount MCP，不增加重复交易缓存行。
-- 重复生成周期义务，不增加重复计划事件。
-- 重复生成房贷计划，不增加重复还款计划。
-- 重复运行匹配，不重复标记或重复影响预测。
-- 重复运行 forecast，不重复累计预测结果。
+- 重复导入同一 CSV，不增加 raw_transactions 行数。
+- 重复同步同一批 BeeCount 交易，不增加 raw_transactions 行数。
+- 重复运行 normalize，不增加 normalized_transactions 行数。
+- 重复运行 classify，不覆盖人工修正。
+- 重复运行 monthly aggregation，不重复累计月度结果。
 
-关键约束示例：
+关键约束：
 
 ```sql
-beecount_transactions_cache.beecount_transaction_id UNIQUE
-loan_payment_schedule(loan_plan_id, due_date) UNIQUE
+normalized_transactions.raw_transaction_id UNIQUE
+monthly_cashflow(year, month) UNIQUE
 ```
 
-## 5. AI 使用边界
+## 4. 分类规则
 
-第一阶段必须规则和确定性计算优先，AI 后置。
+第一阶段必须规则优先，AI 后置。
 
-AI 可以：
+分类规则必须可解释。不要写一个不可审计的 AI 分类黑箱。
 
-- 总结现金流；
-- 解释风险；
-- 发现异常；
-- 推测可能的固定支出；
-- 生成计划事件草案；
-- 给出决策建议。
+`classification_rules` 应支持 `condition_json`，MVP 操作符：
 
-AI 不可以：
+```text
+year_in
+any_text_contains
+direction_in
+account_contains
+amount_cents_min
+amount_cents_max
+```
 
-- 未经确认直接修改 BeeCount Cloud 流水。
-- 未经确认直接新增、删除或停用计划事件。
-- 把推测当作事实。
-- 输出无法追溯到底层流水、计划事件或预测参数的结论。
+分类优先级：
+
+1. 人工覆盖
+2. 2021/2022 historical_debt_asset_event
+3. 内部转账
+4. 信用卡还款
+5. 债务还款
+6. 借入资金
+7. 投资流入/流出
+8. 资产购入/出售
+9. 稳定收入
+10. 一次性收入
+11. 固定刚性支出
+12. 日常生活支出
+13. unknown
+
+## 5. 人工覆盖规则
+
+用户人工修正结果优先于所有自动规则。
+
+如果 `manual_financial_type` 不为空，分类器不得覆盖该交易。
+
+建议字段：
+
+```text
+manual_financial_type
+manual_category_l1
+manual_category_l2
+manual_cashflow_direction
+manual_note
+manual_updated_at
+```
 
 ## 6. CLI 脚本契约
 
@@ -165,14 +163,13 @@ AI 不可以：
 --verbose
 ```
 
-所有脚本必须输出稳定摘要，便于测试和 QA：
+所有脚本必须输出稳定摘要：
 
 ```text
-synced=120 skipped_existing=10 failed=0
-planned_events_generated=12 skipped_existing=12 failed=0
-loan_schedule_generated=12 skipped_existing=12 failed=0
-matched=5 candidates=2 unmatched=10
-risk_level=watch pressure_month=2026-08
+imported=1200 skipped_duplicate=14 failed=0
+normalized=1200 skipped_existing=1200 failed=0
+classified=980 unknown=220 manual_skipped=5
+monthly_generated=38
 ```
 
 错误必须写 stderr，并以非零 exit code 退出。
@@ -185,48 +182,52 @@ risk_level=watch pressure_month=2026-08
 
 ```text
 tests/test_schema.py
-tests/test_beecount_mcp_client.py
-tests/test_sync_beecount.py
-tests/test_planned_events.py
-tests/test_recurring_obligations.py
-tests/test_loan_plans.py
-tests/test_match_actuals.py
-tests/test_cashflow_forecast.py
-tests/test_print_summary.py
+tests/test_fixtures.py
+tests/test_import_csv.py
+tests/test_normalize.py
+tests/test_classify.py
+tests/test_monthly_cashflow.py
+```
+
+必须先创建合成 fixtures：
+
+```text
+tests/fixtures/sample_pixiu_minimal.csv
+tests/fixtures/sample_pixiu_edge_cases.csv
+tests/fixtures/sample_pixiu_2021_2022.csv
 ```
 
 核心测试必须覆盖：
 
-- 重复 MCP 同步不会产生重复缓存交易。
-- 金额全部转为非负整数分。
-- 利率使用 bps，不使用浮点金额。
-- 计划事件 matched 后不重复进入预测。
-- 周期义务重复生成不重复。
-- 房贷计划重复生成不重复。
-- BeeCount 已发生流水和计划事件合并后能正确识别风险。
-- AI 生成建议不得直接写成事实。
+- 重复导入不会产生重复 raw。
+- 真实重复交易不会被 hash 误杀。
+- 重复 normalize 不会产生重复 normalized。
+- 支出/收入都转为正数 cents。
+- 信用卡还款 neutral。
+- 内部转账 neutral。
+- 借入资金不算收入。
+- 投资不算日常生活支出。
+- 资产购入不算生活消费。
+- 人工覆盖不被 classify 覆盖。
+- 2021/2022 不进入日常现金流模型。
+- 月度现金流公式正确。
 
 ## 8. 开发顺序
 
-按 `docs/plans/mvp-implementation-plan-v0.2-beecount-mcp.md` 执行。
+旧的 v0.1 CSV 闭环已经作为历史基础存在。新需求优先按 BeeCount Cloud 作为流水源的路线执行。
 
 当前推荐顺序：
 
 ```text
-Task 0：更新项目边界文档
-Task 1：schema.sql
-Task 2：BeeCount MCP client mock
-Task 3：sync_beecount.py
-Task 4：planned_events.py
-Task 5：recurring_obligations.py
-Task 6：loan_plans.py
-Task 7：match_actuals.py
-Task 8：cashflow_forecast.py
-Task 9：print_summary.py
-Task 10：Web dashboard
+Task 1：明确 BeeCount Cloud 数据源契约和权限边界
+Task 2：实现 BeeCount 交易只读同步到 raw_transactions
+Task 3：复用 normalize / classify / monthly_cashflow
+Task 4：保留 CSV 迁移通道，但不再强化为日常入口
+Task 5：首页现金流安全判断和近期建议
+Task 6：提前还贷、大额消费、买车、投资仓位模拟
 ```
 
-Web 仪表盘必须等 CLI 数据闭环和 pytest 通过后再做。
+任何 BeeCount 写入能力必须谨慎处理。默认只读；如未来接入写入，必须由用户显式授权，并且不得绕过 BeeCount 的审计和确认机制。
 
 ## 9. Git 规则
 
@@ -239,14 +240,13 @@ Web 仪表盘必须等 CLI 数据闭环和 pytest 通过后再做。
 推荐提交粒度：
 
 ```text
-docs: update project boundary for BeeCount MCP
-feat: add beecount mcp cache schema
-feat: sync beecount transactions cache
-feat: add planned cashflow events
-feat: generate recurring obligations
-feat: generate loan payment schedule
-feat: match planned events with actual transactions
-feat: generate cashflow forecast
+chore: add project agent rules
+feat: add sqlite schema and seed rules
+feat: add synthetic pixiu fixtures
+feat: implement csv importer
+feat: implement transaction normalization
+feat: implement rule classifier
+feat: generate monthly cashflow
 ```
 
 ## 10. gstack 使用边界
