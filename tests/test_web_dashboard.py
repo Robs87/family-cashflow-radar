@@ -999,6 +999,48 @@ class TestHttpHandler:
         assert response.status == 200
         assert "同步 BeeCount" in body
 
+    def test_post_refresh_handles_pipeline_failure_without_http_500(self, db_path, monkeypatch):
+        def fake_pipeline(*args, **kwargs):
+            return {
+                "ok": False,
+                "steps": [
+                    {
+                        "label": "同步 BeeCount",
+                        "ok": False,
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": "refresh token 已失效",
+                    }
+                ],
+            }
+
+        monkeypatch.setattr("app.main.run_refresh_pipeline", fake_pipeline)
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {"db_path": db_path, "raw_input_path": FIXTURES_DIR, "beecount_config_path": None},
+        )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/actions/refresh",
+                data=b"",
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert response.status == 200
+        assert "刷新失败" in body
+        assert "refresh token 已失效" in body
+
     def test_post_manual_override(self, db_with_dashboard_data):
         conn = sqlite3.connect(str(db_with_dashboard_data))
         txn_id = conn.execute(

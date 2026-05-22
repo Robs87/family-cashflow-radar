@@ -2865,7 +2865,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             try:
                 body = render_dashboard_html(self.db_path, pipeline_result=result).encode("utf-8")
-                status = 200 if result["ok"] else 500
+                status = 200
             except sqlite3.Error as exc:
                 body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
                 status = 500
