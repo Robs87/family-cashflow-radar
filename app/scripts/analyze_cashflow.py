@@ -82,17 +82,25 @@ def analyze_cashflow(data: dict[str, Any]) -> dict[str, Any]:
     fixed = int(latest["fixed_expense_cents"] or 0)
     debt = int(latest["debt_payment_cents"] or 0)
     net = int(latest["net_operating_cashflow_cents"] or 0)
+    cash_balance = data.get("cash_balance") or {}
+    current_cash = int(cash_balance.get("available_cash_cents") or 0)
+    has_cash_balance = bool(cash_balance)
     unknown_count = int(data.get("unknown_count") or 0)
     pending_count = int(data.get("pending_count") or 0)
     required_outflow = fixed + debt
-    safety_months = round(net / required_outflow, 1) if required_outflow > 0 and net > 0 else 0.0
+    safety_base = current_cash if has_cash_balance else max(net, 0)
+    safety_months = round(safety_base / required_outflow, 1) if required_outflow > 0 and safety_base > 0 else 0.0
 
     anchor = _latest_month_start(latest)
     risk_next_30 = _risk_window_amount(data.get("upcoming_bills", []), anchor, 30)
     risk_next_90 = _risk_window_amount(data.get("upcoming_bills", []), anchor, 90)
     confidence, confidence_reasons = _confidence(unknown_count, pending_count, stable_income)
 
-    if stable_income <= 0 or net < 0:
+    if has_cash_balance and required_outflow > 0 and safety_months < 1:
+        level = "danger"
+        label = "危险状态"
+        action = "当前可用现金不足覆盖 1 个月固定支出和债务还款，先补安全垫。"
+    elif stable_income <= 0 or net < 0:
         level = "danger"
         label = "危险状态"
         action = "未来 30 天先暂停非必要大额消费，并优先补齐稳定收入、固定支出和债务记录。"
@@ -117,9 +125,14 @@ def analyze_cashflow(data: dict[str, Any]) -> dict[str, Any]:
     if confidence != "high":
         confidence_note = " 建议可信度偏低：" + "；".join(confidence_reasons) + "。"
 
+    cash_phrase = (
+        f"当前可用现金 {format_yuan(current_cash)} 元"
+        if has_cash_balance
+        else "未校准当前可用现金，暂用本月基础结余代理安全垫"
+    )
     reason = (
         f"本月基础结余 {format_yuan(net)} 元，固定支出+债务还款 "
-        f"{format_yuan(required_outflow)} 元，代理安全垫约 {safety_months:.1f} 个月；"
+        f"{format_yuan(required_outflow)} 元，{cash_phrase}，安全垫约 {safety_months:.1f} 个月；"
         f"未来 30 天已知刚性风险 {format_yuan(risk_next_30)} 元，未来 3 个月 "
         f"{format_yuan(risk_next_90)} 元。{confidence_note}"
     )
@@ -136,6 +149,10 @@ def analyze_cashflow(data: dict[str, Any]) -> dict[str, Any]:
         confidence=confidence,
         risk_next_30=risk_next_30,
         risk_next_90=risk_next_90,
+        has_cash_balance=has_cash_balance,
+        current_cash=current_cash,
+        safety_months=safety_months,
+        required_outflow=required_outflow,
     )
 
     return {
@@ -163,8 +180,20 @@ def _build_advice_items(
     confidence: str,
     risk_next_30: int,
     risk_next_90: int,
+    has_cash_balance: bool = False,
+    current_cash: int = 0,
+    safety_months: float = 0.0,
+    required_outflow: int = 0,
 ) -> list[str]:
     advice: list[str] = []
+    if not has_cash_balance:
+        advice.append("先校准当前可用现金余额，后续大额消费、提前还贷和投资模拟才有真实安全垫起点。")
+    elif required_outflow > 0 and safety_months < 3:
+        advice.append(
+            f"当前可用现金 {format_yuan(current_cash)} 元，只覆盖固定支出和债务还款约 {safety_months:.1f} 个月，"
+            "建议先把安全垫补到 3 个月以上。"
+        )
+
     if stable_income == 0:
         advice.append("本月还没有稳定收入记录，现金流安全只能低可信判断；先把工资或固定收入补齐。")
     elif net < 0:

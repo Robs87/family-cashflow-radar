@@ -31,6 +31,14 @@ from app.scripts.beecount_category_mappings import (
     FINANCIAL_TYPES as MAPPING_FINANCIAL_TYPES,
     ensure_mapping_schema,
 )
+from app.scripts.cash_balance import (
+    DEFAULT_SCOPE as DEFAULT_CASH_BALANCE_SCOPE,
+    latest_cash_balance,
+    parse_yuan_to_cents as parse_cash_balance_yuan_to_cents,
+    safety_months as cash_balance_safety_months,
+    save_cash_balance_calibration,
+    validate_date as validate_cash_balance_date,
+)
 from app.scripts.generate_monthly_cashflow import generate_monthly_cashflow
 from app.scripts.import_beecount import import_beecount
 from app.scripts.import_csv import import_csv
@@ -393,6 +401,7 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
                ORDER BY id DESC
                LIMIT 6"""
         ).fetchall()
+        cash_balance = latest_cash_balance(conn)
     finally:
         conn.close()
 
@@ -417,6 +426,7 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
         "debt_split_summary": dict(debt_split_summary) if debt_split_summary else {},
         "prepayment_events": [dict(row) for row in prepayment_events],
         "decision_scenarios": [dict(row) for row in decision_scenarios],
+        "cash_balance": cash_balance.__dict__ if cash_balance else None,
     }
 
 
@@ -979,6 +989,27 @@ def update_saved_mortgage_prepayment(
     except Exception as exc:
         return {"ok": False, "message": str(exc)}
     return {"ok": True, "message": f"提前还贷事件已更新，后续还款计划已重算: #{new_event_id}"}
+
+
+def save_current_cash_balance(
+    db_path: Path,
+    amount_yuan: str,
+    calibration_date: str,
+    scope: str = "",
+    note: str = "",
+) -> dict:
+    try:
+        amount_cents = parse_cash_balance_yuan_to_cents(amount_yuan)
+        calibration_id = save_cash_balance_calibration(
+            db_path,
+            amount_cents,
+            validate_cash_balance_date(calibration_date),
+            scope=scope.strip() or DEFAULT_CASH_BALANCE_SCOPE,
+            note=note.strip(),
+        )
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+    return {"ok": True, "message": f"现金余额已校准: #{calibration_id}"}
 
 
 def save_decision_simulation(
@@ -1686,6 +1717,43 @@ def _render_decision_scenarios(rows: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def _render_cash_balance_form(cash_balance: dict | None, latest_month: dict | None) -> str:
+    today = date.today().isoformat()
+    amount_value = ""
+    scope_value = DEFAULT_CASH_BALANCE_SCOPE
+    note_value = ""
+    summary = '<p class="empty">暂无现金余额校准</p>'
+    if cash_balance:
+        amount_cents = int(cash_balance.get("available_cash_cents") or 0)
+        amount_value = f"{amount_cents / 100:.2f}"
+        scope_value = str(cash_balance.get("scope") or DEFAULT_CASH_BALANCE_SCOPE)
+        note_value = str(cash_balance.get("note") or "")
+        fixed_debt = 0
+        if latest_month:
+            fixed_debt = int(latest_month.get("fixed_expense_cents") or 0) + int(
+                latest_month.get("debt_payment_cents") or 0
+            )
+        months = cash_balance_safety_months(amount_cents, fixed_debt)
+        summary = (
+            '<div class="balance-summary">'
+            f'<strong>{html.escape(_format_yuan(amount_cents))} 元</strong>'
+            f'<span>校准日 {html.escape(str(cash_balance.get("calibration_date") or ""))} · '
+            f'覆盖固定支出和债务还款约 {months:.1f} 个月</span>'
+            "</div>"
+        )
+    return (
+        '<form class="entry-form compact-form" method="post" action="/actions/cash-balance">'
+        '<h3>现金余额校准</h3>'
+        f"{summary}"
+        f'<label>可用现金<input type="number" name="amount_yuan" min="0" step="0.01" value="{html.escape(amount_value)}" required></label>'
+        f'<label>校准日期<input type="date" name="calibration_date" value="{html.escape(today)}" required></label>'
+        f'<label class="entry-wide">统计口径<input name="scope" value="{html.escape(scope_value)}"></label>'
+        f'<label class="entry-wide">备注<input name="note" value="{html.escape(note_value)}" placeholder="可选"></label>'
+        '<button type="submit">保存校准</button>'
+        "</form>"
+    )
+
+
 def _render_recurring_templates(rows: list[dict]) -> str:
     if not rows:
         return '<p class="empty">暂无周期账单模板</p>'
@@ -1930,6 +1998,7 @@ def render_dashboard_html(
     recurring_forms_html = _render_recurring_forms()
     mortgage_prepayment_form_html = _render_mortgage_prepayment_form(data["mortgage_templates"])
     decision_simulator_form_html = _render_decision_simulator_form(data["mortgage_templates"])
+    cash_balance_form_html = _render_cash_balance_form(data["cash_balance"], latest)
     advice_html = _render_financial_advice(data)
     recent_transactions_html = _render_recent_transactions(data["recent_transactions"])
     expense_breakdown_html = _render_expense_breakdown(data["expense_breakdown"])
@@ -2161,6 +2230,24 @@ def render_dashboard_html(
     .recurring-forms {{
       display: grid;
       gap: 14px;
+    }}
+    .balance-summary {{
+      grid-column: 1 / -1;
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+    }}
+    .balance-summary strong {{
+      font-size: 18px;
+      font-variant-numeric: tabular-nums;
+    }}
+    .balance-summary span {{
+      color: var(--muted);
+      font-size: 12px;
     }}
     .generate-form {{
       display: flex;
@@ -2491,6 +2578,7 @@ def render_dashboard_html(
       <div class="panel">
         <h2>财务建议</h2>
         {advice_html}
+        {cash_balance_form_html}
       </div>
     </section>
     <section class="metrics">{metrics}</section>
@@ -2734,6 +2822,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except sqlite3.Error as exc:
                 body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
                 status = 500
+        elif parsed.path == "/actions/cash-balance":
+            notice = self._handle_cash_balance()
+            try:
+                body = render_dashboard_html(self.db_path, notice=notice).encode("utf-8")
+                status = 200 if notice["ok"] else 400
+            except sqlite3.Error as exc:
+                body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
+                status = 500
         elif parsed.path == "/actions/beecount-token-config":
             notice = self._handle_beecount_token_config()
             body = render_beecount_settings_html(
@@ -2921,6 +3017,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             monthly_payment_yuan=fields.get("monthly_payment_yuan", [""])[0],
             mortgage_template_id_text=fields.get("mortgage_template_id", [""])[0],
             mortgage_effect_type=fields.get("mortgage_effect_type", ["reduce_term"])[0],
+        )
+
+    def _handle_cash_balance(self) -> dict:
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        raw_body = self.rfile.read(content_length).decode("utf-8")
+        fields = parse_qs(raw_body)
+        return save_current_cash_balance(
+            self.db_path,
+            fields.get("amount_yuan", [""])[0],
+            fields.get("calibration_date", [""])[0],
+            scope=fields.get("scope", [""])[0],
+            note=fields.get("note", [""])[0],
         )
 
     def _handle_beecount_token_config(self) -> dict:

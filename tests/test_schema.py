@@ -15,6 +15,7 @@ EXPECTED_TABLES = {
     "asset_events",
     "debts",
     "cashflow_forecast",
+    "cash_balance_calibrations",
     "decision_scenarios",
     "recurring_bill_templates",
     "mortgage_repayment_schedule",
@@ -73,6 +74,12 @@ def test_raw_transactions_has_beecount_version_fields(db_conn):
         "source_is_latest",
     ]:
         assert field in cols
+
+
+def test_cash_balance_calibrations_uses_integer_cents(db_conn):
+    cols = _get_column_types(db_conn, "cash_balance_calibrations")
+    assert cols["available_cash_cents"] == "INTEGER"
+    assert cols["calibration_date"] == "TEXT"
 
 
 def test_no_real_amount_in_normalized(db_conn):

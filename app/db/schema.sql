@@ -253,6 +253,21 @@ CREATE TABLE IF NOT EXISTS cashflow_forecast (
 );
 
 -- ============================================================
+-- 7.1. cash_balance_calibrations: 当前现金余额校准
+-- ============================================================
+CREATE TABLE IF NOT EXISTS cash_balance_calibrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    calibration_date TEXT NOT NULL,
+    available_cash_cents INTEGER NOT NULL CHECK(available_cash_cents >= 0),
+    scope TEXT DEFAULT '家庭现金账户、活期、货币基金等可快速动用资金',
+    note TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_cash_balance_latest
+    ON cash_balance_calibrations(calibration_date DESC, id DESC);
+
+-- ============================================================
 -- 8. decision_scenarios: 决策模拟
 -- ============================================================
 CREATE TABLE IF NOT EXISTS decision_scenarios (

@@ -23,6 +23,7 @@ from app.main import (
     run_recurring_generation,
     save_beecount_token_config,
     save_beecount_category_mapping,
+    save_current_cash_balance,
     save_decision_simulation,
     save_fixed_bill_template,
     save_manual_override,
@@ -832,6 +833,31 @@ class TestRecurringWebActions:
         assert "最近模拟结果" in html
         assert "执行后安全垫" in html or "不建议执行" in html
 
+    def test_save_current_cash_balance_renders_calibration(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """INSERT INTO monthly_cashflow
+               (year, month, stable_income_cents, living_expense_cents,
+                fixed_expense_cents, debt_payment_cents, net_operating_cashflow_cents)
+               VALUES (2026, 5, 2000000, 500000, 300000, 200000, 1000000)"""
+        )
+        conn.commit()
+        conn.close()
+
+        result = save_current_cash_balance(
+            db_path,
+            "150000",
+            "2026-05-22",
+            scope="活期+货基",
+            note="月底校准",
+        )
+
+        assert result == {"ok": True, "message": "现金余额已校准: #1"}
+        html = render_dashboard_html(db_path)
+        assert "现金余额校准" in html
+        assert "150,000.00 元" in html
+        assert "覆盖固定支出和债务还款约 30.0 个月" in html
+
     def test_save_decision_simulation_includes_mortgage_interest_savings(self, db_path):
         conn = sqlite3.connect(str(db_path))
         conn.execute(
@@ -1154,6 +1180,46 @@ class TestHttpHandler:
 
         conn = sqlite3.connect(str(db_path))
         count = conn.execute("SELECT COUNT(*) FROM decision_scenarios").fetchone()[0]
+        conn.close()
+        assert count == 1
+
+    def test_post_cash_balance(self, db_path):
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {"db_path": db_path, "raw_input_path": FIXTURES_DIR, "beecount_config_path": None},
+        )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            data = urlencode(
+                {
+                    "amount_yuan": "80000",
+                    "calibration_date": "2026-05-22",
+                    "scope": "活期",
+                    "note": "校准",
+                }
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/actions/cash-balance",
+                data=data,
+                method="POST",
+            )
+            request.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert response.status == 200
+        assert "现金余额已校准" in body
+
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute("SELECT COUNT(*) FROM cash_balance_calibrations").fetchone()[0]
         conn.close()
         assert count == 1
 

@@ -63,6 +63,23 @@ def _ensure_beecount_mapping_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_cash_balance_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS cash_balance_calibrations (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               calibration_date TEXT NOT NULL,
+               available_cash_cents INTEGER NOT NULL CHECK(available_cash_cents >= 0),
+               scope TEXT DEFAULT '家庭现金账户、活期、货币基金等可快速动用资金',
+               note TEXT DEFAULT '',
+               created_at TEXT DEFAULT CURRENT_TIMESTAMP
+           )"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_cash_balance_latest
+           ON cash_balance_calibrations(calibration_date DESC, id DESC)"""
+    )
+
+
 def _table_sql(conn: sqlite3.Connection, table: str) -> str:
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -309,6 +326,7 @@ def ensure_v02_schema(conn: sqlite3.Connection) -> None:
         _ensure_monthly_columns(conn)
         _ensure_raw_beecount_columns(conn)
         _ensure_beecount_mapping_table(conn)
+        _ensure_cash_balance_table(conn)
         _ensure_v02_rules(conn)
         _ensure_indexes(conn)
     finally:

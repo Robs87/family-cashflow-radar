@@ -12,7 +12,9 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from app.scripts.cash_balance import latest_cash_balance
 from app.scripts.recurring import build_equal_payment_schedule, build_fixed_payment_schedule
+from app.scripts.schema_migrations import ensure_v02_schema
 
 
 DECISION_TYPES = {"mortgage_prepayment", "large_purchase", "investment"}
@@ -223,7 +225,9 @@ def simulate_decision(
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
+        ensure_v02_schema(conn)
         latest = _latest_month(conn)
+        cash_balance = latest_cash_balance(conn)
         interest_savings_cents, term_months_delta, mortgage_detail = (
             _estimate_mortgage_prepayment_savings(
                 conn,
@@ -242,7 +246,11 @@ def simulate_decision(
         latest["debt_payment_cents"] or 0
     )
     base_net = int(latest["net_operating_cashflow_cents"] or 0)
-    opening_buffer = max(base_net, 0)
+    opening_buffer = (
+        int(cash_balance.available_cash_cents)
+        if cash_balance is not None
+        else max(base_net, 0)
+    )
     min_balance = opening_buffer
     min_safety = float("inf")
     risk_month = start_month
