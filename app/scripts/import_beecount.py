@@ -7,6 +7,7 @@ classify, monthly cashflow, and advice pipeline can consume them.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from app.scripts.beecount_tokens import get_token, write_keychain_token
+from app.scripts.schema_migrations import ensure_v02_schema
 
 
 TX_TYPES = {"expense", "income", "transfer"}
@@ -30,12 +32,13 @@ TX_TYPES = {"expense", "income", "transfer"}
 class ImportSummary:
     imported: int = 0
     updated: int = 0
+    deleted: int = 0
     skipped_duplicate: int = 0
     failed: int = 0
 
     def __str__(self) -> str:
         return (
-            f"imported={self.imported} updated={self.updated} "
+            f"imported={self.imported} updated={self.updated} deleted={self.deleted} "
             f"skipped_duplicate={self.skipped_duplicate} failed={self.failed}"
         )
 
@@ -75,6 +78,16 @@ def _source_transaction_id(raw: dict[str, Any]) -> str:
     if not value:
         raise ValueError("缺少 BeeCount 交易标识 sync_id / syncId / id")
     return str(value)
+
+
+def _source_updated_at(raw: dict[str, Any]) -> str:
+    return str(raw.get("updated_at") or raw.get("updatedAt") or raw.get("modified_at") or raw.get("modifiedAt") or "")
+
+
+def _source_deleted_at(raw: dict[str, Any]) -> str:
+    if bool(raw.get("is_deleted") or raw.get("isDeleted") or raw.get("deleted")):
+        return str(raw.get("deleted_at") or raw.get("deletedAt") or raw.get("updated_at") or raw.get("updatedAt") or "")
+    return str(raw.get("deleted_at") or raw.get("deletedAt") or "")
 
 
 def _tags(raw: dict[str, Any]) -> str:
@@ -124,8 +137,26 @@ def _normalize_payload(input_payload: Any, ledger_id: str | None = None) -> tupl
     return str(effective_ledger_id), [item for item in items if isinstance(item, dict)]
 
 
+def _payload_json(ledger_id: str, raw: dict[str, Any]) -> str:
+    payload = {
+        "source_system": "beecount_cloud",
+        "source_ledger_id": ledger_id,
+        "source_transaction_id": _source_transaction_id(raw),
+        "source_updated_at": _source_updated_at(raw),
+        "source_deleted_at": _source_deleted_at(raw),
+        "transaction": raw,
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _payload_fingerprint(raw: dict[str, Any]) -> str:
+    canonical = json.dumps(raw, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def _raw_hash(ledger_id: str, raw: dict[str, Any]) -> str:
-    return f"beecount_cloud:{ledger_id}:{_source_transaction_id(raw)}"
+    version = _source_updated_at(raw) or _source_deleted_at(raw) or _payload_fingerprint(raw)
+    return f"beecount_cloud:{ledger_id}:{_source_transaction_id(raw)}:{version}"
 
 
 def _row_values(ledger_id: str, source_row_no: int, raw: dict[str, Any]) -> tuple[Any, ...]:
@@ -138,12 +169,9 @@ def _row_values(ledger_id: str, source_row_no: int, raw: dict[str, Any]) -> tupl
     expense_original = amount_original if tx_type == "expense" else ""
     category = str(raw.get("category_name") or raw.get("categoryName") or "").strip()
     note = str(raw.get("note") or "").strip()
-    payload = {
-        "source_system": "beecount_cloud",
-        "source_ledger_id": ledger_id,
-        "source_transaction_id": _source_transaction_id(raw),
-        "transaction": raw,
-    }
+    source_transaction_id = _source_transaction_id(raw)
+    source_updated_at = _source_updated_at(raw)
+    source_deleted_at = _source_deleted_at(raw)
     return (
         f"beecount_cloud:{ledger_id}",
         source_row_no,
@@ -161,8 +189,14 @@ def _row_values(ledger_id: str, source_row_no: int, raw: dict[str, Any]) -> tupl
         note,
         "",
         _tags(raw),
-        json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str),
+        _payload_json(ledger_id, raw),
         _raw_hash(ledger_id, raw),
+        "beecount_cloud",
+        ledger_id,
+        source_transaction_id,
+        source_updated_at,
+        source_deleted_at,
+        1,
     )
 
 
@@ -174,10 +208,11 @@ def import_beecount_payload(
     verbose: bool = False,
 ) -> ImportSummary:
     effective_ledger_id, transactions = _normalize_payload(payload, ledger_id=ledger_id)
-    imported = updated = skipped = failed = 0
+    imported = updated = deleted = skipped = failed = 0
 
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA foreign_keys=ON")
+    ensure_v02_schema(conn)
     cursor = conn.cursor()
     try:
         for source_row_no, raw in enumerate(transactions, start=1):
@@ -196,13 +231,49 @@ def import_beecount_payload(
 
             existing = cursor.execute(
                 "SELECT raw_payload FROM raw_transactions WHERE raw_hash = ?",
-                (row[-1],),
+                (row[17],),
             ).fetchone()
-            if existing and existing[0] == row[-2]:
+            raw_hash = row[17]
+            source_system = row[18]
+            source_ledger_id = row[19]
+            source_transaction_id = row[20]
+            source_deleted_at = row[22]
+            prior_latest = cursor.execute(
+                """SELECT raw_hash
+                   FROM raw_transactions
+                   WHERE source_system = ?
+                     AND source_ledger_id = ?
+                     AND source_transaction_id = ?
+                     AND source_is_latest = 1
+                   ORDER BY id DESC
+                   LIMIT 1""",
+                (source_system, source_ledger_id, source_transaction_id),
+            ).fetchone()
+            if existing and existing[0] == row[16]:
+                if prior_latest and prior_latest[0] != raw_hash:
+                    cursor.execute(
+                        """UPDATE raw_transactions
+                           SET source_is_latest = CASE WHEN raw_hash = ? THEN 1 ELSE 0 END
+                           WHERE source_system = ?
+                             AND source_ledger_id = ?
+                             AND source_transaction_id = ?""",
+                        (raw_hash, source_system, source_ledger_id, source_transaction_id),
+                    )
                 skipped += 1
                 continue
 
             if existing:
+                cursor.execute(
+                    """DELETE FROM normalized_transactions
+                       WHERE raw_transaction_id IN (
+                           SELECT id
+                           FROM raw_transactions
+                           WHERE source_system = ?
+                             AND source_ledger_id = ?
+                             AND source_transaction_id = ?
+                       )""",
+                    (source_system, source_ledger_id, source_transaction_id),
+                )
                 cursor.execute(
                     """UPDATE raw_transactions
                        SET source_file = ?,
@@ -222,28 +293,61 @@ def import_beecount_payload(
                            project = ?,
                            tags = ?,
                            raw_payload = ?,
+                           source_system = ?,
+                           source_ledger_id = ?,
+                           source_transaction_id = ?,
+                           source_updated_at = ?,
+                           source_deleted_at = ?,
+                           source_is_latest = ?,
                            imported_at = CURRENT_TIMESTAMP
                        WHERE raw_hash = ?""",
-                    row,
+                    row[:17] + row[18:] + (raw_hash,),
                 )
                 updated += 1
             else:
+                if prior_latest:
+                    cursor.execute(
+                        """DELETE FROM normalized_transactions
+                           WHERE raw_transaction_id IN (
+                               SELECT id
+                               FROM raw_transactions
+                               WHERE source_system = ?
+                                 AND source_ledger_id = ?
+                                 AND source_transaction_id = ?
+                           )""",
+                        (source_system, source_ledger_id, source_transaction_id),
+                    )
+                cursor.execute(
+                    """UPDATE raw_transactions
+                       SET source_is_latest = 0
+                       WHERE source_system = ?
+                         AND source_ledger_id = ?
+                         AND source_transaction_id = ?""",
+                    (source_system, source_ledger_id, source_transaction_id),
+                )
                 cursor.execute(
                     """INSERT INTO raw_transactions
                     (source_file, source_row_no, transaction_time, transaction_date,
                      amount_original, income_amount_original, expense_amount_original,
                      amount_cents, direction_raw, account, category_original,
                      subcategory_original, merchant, note, project, tags,
-                     raw_payload, raw_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     raw_payload, raw_hash, source_system, source_ledger_id,
+                     source_transaction_id, source_updated_at, source_deleted_at,
+                     source_is_latest)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     row,
                 )
-                imported += 1
+                if source_deleted_at:
+                    deleted += 1
+                elif prior_latest:
+                    updated += 1
+                else:
+                    imported += 1
 
         conn.commit()
     finally:
         conn.close()
-    return ImportSummary(imported=imported, updated=updated, skipped_duplicate=skipped, failed=failed)
+    return ImportSummary(imported=imported, updated=updated, deleted=deleted, skipped_duplicate=skipped, failed=failed)
 
 
 def _refresh_access_token(base_url: str, refresh_token: str) -> dict[str, Any]:

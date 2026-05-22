@@ -51,10 +51,10 @@ type: log
 - 将 `docs/plans/mvp-implementation-plan-v0.2-beecount-mcp.md` 标记为 superseded，避免后续施工回到 MCP cache / 全新 schema / CLI-first 的旧路线。
 - 在当前计划中补齐未完成主线：BeeCount 更新/删除语义、当前现金余额校准、未来计划事件、计划与实际流水匹配去重、大额消费分期成本和投资仓位上限。
 - 在 v0.3 BeeCount 计划中明确交易修改、删除、恢复后的最新版本选择要求。
+- 落地 BeeCount 更新/删除/最新版本语义：raw 层保留 BeeCount 多版本，normalized/monthly/advice 只消费最新且未删除版本；旧数据库会回填 BeeCount 来源字段。
 
 ## 待办
 
-- 补齐 BeeCount 交易更新 / 删除 / 最新版本选择语义。
 - 实现当前现金余额校准，作为安全垫和预测起点。
 - 实现未来计划事件和实际 BeeCount 流水匹配去重。
 - 继续细化大额消费 / 买车分期成本模拟器。

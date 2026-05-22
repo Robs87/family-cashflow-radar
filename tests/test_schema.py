@@ -62,6 +62,19 @@ def test_raw_transactions_amount_cents_is_integer(db_conn):
     assert cols["amount_cents"] == "INTEGER"
 
 
+def test_raw_transactions_has_beecount_version_fields(db_conn):
+    cols = _get_column_types(db_conn, "raw_transactions")
+    for field in [
+        "source_system",
+        "source_ledger_id",
+        "source_transaction_id",
+        "source_updated_at",
+        "source_deleted_at",
+        "source_is_latest",
+    ]:
+        assert field in cols
+
+
 def test_no_real_amount_in_normalized(db_conn):
     """Normalized table must not use REAL for any monetary field."""
     cols = _get_column_types(db_conn, "normalized_transactions")

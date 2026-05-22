@@ -90,14 +90,17 @@ def _compute_derived(row: dict[str, int | float | None]) -> None:
 
 def _monthly_rows(conn: sqlite3.Connection) -> list[dict[str, int | float | None]]:
     rows = conn.execute(
-        """SELECT year,
-                  month,
-                  COALESCE(manual_financial_type, financial_type) AS effective_financial_type,
-                  COALESCE(manual_cashflow_direction, cashflow_direction) AS effective_cashflow_direction,
-                  amount_cents
-           FROM normalized_transactions
-           WHERE COALESCE(manual_financial_type, financial_type) != 'historical_debt_asset_event'
-           ORDER BY year, month, id"""
+        """SELECT n.year,
+                  n.month,
+                  COALESCE(n.manual_financial_type, n.financial_type) AS effective_financial_type,
+                  COALESCE(n.manual_cashflow_direction, n.cashflow_direction) AS effective_cashflow_direction,
+                  n.amount_cents
+           FROM normalized_transactions n
+           JOIN raw_transactions r ON r.id = n.raw_transaction_id
+           WHERE COALESCE(n.manual_financial_type, n.financial_type) != 'historical_debt_asset_event'
+             AND COALESCE(r.source_is_latest, 1) = 1
+             AND COALESCE(r.source_deleted_at, '') = ''
+           ORDER BY n.year, n.month, n.id"""
     ).fetchall()
 
     months: dict[tuple[int, int], dict[str, int | float | None]] = {}

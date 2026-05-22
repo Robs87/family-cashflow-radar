@@ -14,6 +14,7 @@ from app.scripts.beecount_tokens import StoredToken
 from app.scripts.classify import classify
 from app.scripts.beecount_category_mappings import infer_category_mapping, upsert_mapping
 from app.scripts.import_beecount import import_beecount, import_beecount_payload
+from app.scripts.generate_monthly_cashflow import generate_monthly_cashflow
 from app.scripts.normalize import normalize
 from tests.conftest import FIXTURES_DIR, PROJECT_ROOT, SCHEMA_SQL
 
@@ -47,7 +48,7 @@ def _fetch_raw(db_path: Path) -> list[dict]:
 def test_import_beecount_transactions_maps_direction_and_amounts(db_path):
     summary = import_beecount_payload(db_path, _load_payload())
 
-    assert str(summary) == "imported=3 updated=0 skipped_duplicate=0 failed=0"
+    assert str(summary) == "imported=3 updated=0 deleted=0 skipped_duplicate=0 failed=0"
     rows = _fetch_raw(db_path)
     assert [row["direction_raw"] for row in rows] == ["收入", "支出", "转账"]
     assert [row["amount_cents"] for row in rows] == [2000000, 6850, 500000]
@@ -56,7 +57,11 @@ def test_import_beecount_transactions_maps_direction_and_amounts(db_path):
     assert rows[2]["income_amount_original"] == ""
     assert rows[2]["expense_amount_original"] == ""
     assert rows[2]["account"] == "招商银行->交通银行"
-    assert rows[0]["raw_hash"] == "beecount_cloud:ledger_family_demo:bc_tx_income_001"
+    assert rows[0]["raw_hash"].startswith("beecount_cloud:ledger_family_demo:bc_tx_income_001:")
+    assert rows[0]["source_system"] == "beecount_cloud"
+    assert rows[0]["source_ledger_id"] == "ledger_family_demo"
+    assert rows[0]["source_transaction_id"] == "bc_tx_income_001"
+    assert rows[0]["source_is_latest"] == 1
 
 
 def test_import_beecount_is_idempotent(db_path):
@@ -65,23 +70,104 @@ def test_import_beecount_is_idempotent(db_path):
     second = import_beecount_payload(db_path, payload)
 
     assert first.imported == 3
-    assert str(second) == "imported=0 updated=0 skipped_duplicate=3 failed=0"
+    assert str(second) == "imported=0 updated=0 deleted=0 skipped_duplicate=3 failed=0"
     assert len(_fetch_raw(db_path)) == 3
 
 
 def test_import_beecount_updates_existing_transaction_by_sync_id(db_path):
     payload = _load_payload()
     import_beecount_payload(db_path, payload)
+    payload["transactions"][1]["updated_at"] = "2026-05-04T12:00:00+08:00"
     payload["transactions"][1]["amount"] = "70.00"
     payload["transactions"][1]["note"] = "午饭修正"
 
     summary = import_beecount_payload(db_path, payload)
 
-    assert str(summary) == "imported=0 updated=1 skipped_duplicate=2 failed=0"
+    assert str(summary) == "imported=0 updated=1 deleted=0 skipped_duplicate=2 failed=0"
     rows = _fetch_raw(db_path)
-    assert rows[1]["amount_cents"] == 7000
-    assert rows[1]["note"] == "午饭修正"
-    assert len(rows) == 3
+    latest = [row for row in rows if row["source_transaction_id"] == "bc_tx_expense_001" and row["source_is_latest"] == 1]
+    old = [row for row in rows if row["source_transaction_id"] == "bc_tx_expense_001" and row["source_is_latest"] == 0]
+    assert len(latest) == 1
+    assert latest[0]["amount_cents"] == 7000
+    assert latest[0]["note"] == "午饭修正"
+    assert len(old) == 1
+    assert len(rows) == 4
+
+
+def test_beecount_updated_transaction_replaces_normalized_monthly_value(db_path):
+    payload = _load_payload()
+    import_beecount_payload(db_path, payload)
+    normalize(db_path)
+    classify(db_path)
+    generate_monthly_cashflow(db_path)
+
+    payload["transactions"][1]["updated_at"] = "2026-05-04T12:00:00+08:00"
+    payload["transactions"][1]["amount"] = "70.00"
+    import_beecount_payload(db_path, payload)
+    normalize(db_path)
+    classify(db_path)
+    generate_monthly_cashflow(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    latest_rows = conn.execute(
+        """SELECT COUNT(*)
+           FROM raw_transactions
+           WHERE source_transaction_id = 'bc_tx_expense_001'
+             AND source_is_latest = 1"""
+    ).fetchone()[0]
+    normalized_count = conn.execute("SELECT COUNT(*) FROM normalized_transactions").fetchone()[0]
+    living = conn.execute(
+        "SELECT living_expense_cents FROM monthly_cashflow WHERE year = 2026 AND month = 5"
+    ).fetchone()[0]
+    conn.close()
+
+    assert latest_rows == 1
+    assert normalized_count == 3
+    assert living == 7000
+
+
+def test_beecount_deleted_transaction_is_not_normalized_or_counted(db_path):
+    payload = _load_payload()
+    import_beecount_payload(db_path, payload)
+    normalize(db_path)
+    classify(db_path)
+    generate_monthly_cashflow(db_path)
+
+    tombstone = {
+        "ledger_id": "ledger_family_demo",
+        "transactions": [
+            {
+                **payload["transactions"][1],
+                "updated_at": "2026-05-05T12:00:00+08:00",
+                "deleted_at": "2026-05-05T12:00:00+08:00",
+                "is_deleted": True,
+            }
+        ],
+    }
+    summary = import_beecount_payload(db_path, tombstone)
+    normalize(db_path)
+    classify(db_path)
+    generate_monthly_cashflow(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    deleted_latest = conn.execute(
+        """SELECT source_deleted_at, source_is_latest
+           FROM raw_transactions
+           WHERE source_transaction_id = 'bc_tx_expense_001'
+           ORDER BY id DESC
+           LIMIT 1"""
+    ).fetchone()
+    normalized_count = conn.execute("SELECT COUNT(*) FROM normalized_transactions").fetchone()[0]
+    living = conn.execute(
+        "SELECT living_expense_cents FROM monthly_cashflow WHERE year = 2026 AND month = 5"
+    ).fetchone()[0]
+    conn.close()
+
+    assert str(summary) == "imported=0 updated=0 deleted=1 skipped_duplicate=0 failed=0"
+    assert deleted_latest[0] == "2026-05-05T12:00:00+08:00"
+    assert deleted_latest[1] == 1
+    assert normalized_count == 2
+    assert living == 0
 
 
 def test_import_beecount_rejects_bad_transaction_without_stopping_batch(db_path):
@@ -111,7 +197,7 @@ def test_import_beecount_cli_input_json(db_path):
     )
 
     assert result.returncode == 0
-    assert "imported=3 updated=0 skipped_duplicate=0 failed=0" in result.stdout
+    assert "imported=3 updated=0 deleted=0 skipped_duplicate=0 failed=0" in result.stdout
     assert len(_fetch_raw(db_path)) == 3
 
 

@@ -10,6 +10,11 @@ import sqlite3
 import sys
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from app.scripts.schema_migrations import ensure_v02_schema
+
 LARGE_AMOUNT_THRESHOLD = 1_000_000  # 10,000 yuan in cents
 
 # Keywords that indicate neutral (internal transfer / credit card payment)
@@ -53,12 +58,16 @@ def _extract_year_month(date_str: str) -> tuple[int, int]:
 def normalize(db_path: Path, dry_run: bool = False, verbose: bool = False) -> None:
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA foreign_keys=ON")
+    ensure_v02_schema(conn)
     cursor = conn.cursor()
 
     raw_rows = cursor.execute(
         """SELECT id, transaction_date, amount_cents, direction_raw,
                   category_original, subcategory_original, merchant, note, account
-           FROM raw_transactions ORDER BY id"""
+           FROM raw_transactions
+           WHERE COALESCE(source_is_latest, 1) = 1
+             AND COALESCE(source_deleted_at, '') = ''
+           ORDER BY id"""
     ).fetchall()
 
     total_normalized = 0

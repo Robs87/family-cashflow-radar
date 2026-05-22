@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 import sqlite3
 from pathlib import Path
 
@@ -18,6 +19,14 @@ CHECK_TABLES = (
 MONTHLY_COLUMNS = {
     "reimbursable_expense_cents": "INTEGER DEFAULT 0 CHECK(reimbursable_expense_cents >= 0)",
     "reimbursement_income_cents": "INTEGER DEFAULT 0 CHECK(reimbursement_income_cents >= 0)",
+}
+RAW_BEECOUNT_COLUMNS = {
+    "source_system": "TEXT",
+    "source_ledger_id": "TEXT",
+    "source_transaction_id": "TEXT",
+    "source_updated_at": "TEXT",
+    "source_deleted_at": "TEXT",
+    "source_is_latest": "INTEGER NOT NULL DEFAULT 1 CHECK(source_is_latest IN (0, 1))",
 }
 
 
@@ -107,6 +116,58 @@ def _ensure_monthly_columns(conn: sqlite3.Connection) -> None:
     for column, definition in MONTHLY_COLUMNS.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE monthly_cashflow ADD COLUMN {column} {definition}")
+
+
+def _ensure_raw_beecount_columns(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "raw_transactions"):
+        return
+    existing = set(_columns(conn, "raw_transactions"))
+    for column, definition in RAW_BEECOUNT_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE raw_transactions ADD COLUMN {column} {definition}")
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_raw_source_latest
+           ON raw_transactions(source_system, source_ledger_id, source_transaction_id, source_is_latest)"""
+    )
+    rows = conn.execute(
+        """SELECT id, source_file, raw_hash, raw_payload
+           FROM raw_transactions
+           WHERE source_file LIKE 'beecount_cloud:%'
+             AND COALESCE(source_system, '') = ''"""
+    ).fetchall()
+    for row_id, source_file, raw_hash, raw_payload in rows:
+        ledger_id = str(source_file or "").split(":", 1)[1] if ":" in str(source_file or "") else ""
+        source_transaction_id = ""
+        source_updated_at = ""
+        source_deleted_at = ""
+        try:
+            payload = json.loads(raw_payload or "{}")
+            source_transaction_id = str(payload.get("source_transaction_id") or "")
+            source_updated_at = str(payload.get("source_updated_at") or "")
+            source_deleted_at = str(payload.get("source_deleted_at") or "")
+            tx = payload.get("transaction") if isinstance(payload.get("transaction"), dict) else {}
+            source_transaction_id = source_transaction_id or str(
+                tx.get("sync_id") or tx.get("syncId") or tx.get("id") or tx.get("transaction_id") or ""
+            )
+            source_updated_at = source_updated_at or str(tx.get("updated_at") or tx.get("updatedAt") or "")
+            source_deleted_at = source_deleted_at or str(tx.get("deleted_at") or tx.get("deletedAt") or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        if not source_transaction_id:
+            parts = str(raw_hash or "").split(":")
+            if len(parts) >= 3:
+                source_transaction_id = parts[2]
+        conn.execute(
+            """UPDATE raw_transactions
+               SET source_system = 'beecount_cloud',
+                   source_ledger_id = ?,
+                   source_transaction_id = ?,
+                   source_updated_at = ?,
+                   source_deleted_at = ?,
+                   source_is_latest = 1
+               WHERE id = ?""",
+            (ledger_id, source_transaction_id, source_updated_at, source_deleted_at, row_id),
+        )
 
 
 def _insert_rule_if_missing(
@@ -246,6 +307,7 @@ def ensure_v02_schema(conn: sqlite3.Connection) -> None:
                 _rebuild_table(conn, table)
 
         _ensure_monthly_columns(conn)
+        _ensure_raw_beecount_columns(conn)
         _ensure_beecount_mapping_table(conn)
         _ensure_v02_rules(conn)
         _ensure_indexes(conn)

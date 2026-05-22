@@ -28,11 +28,19 @@ CREATE TABLE IF NOT EXISTS raw_transactions (
     tags TEXT,
     raw_payload TEXT,
     raw_hash TEXT NOT NULL UNIQUE,
+    source_system TEXT,
+    source_ledger_id TEXT,
+    source_transaction_id TEXT,
+    source_updated_at TEXT,
+    source_deleted_at TEXT,
+    source_is_latest INTEGER NOT NULL DEFAULT 1 CHECK(source_is_latest IN (0, 1)),
     imported_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_raw_transaction_date ON raw_transactions(transaction_date);
 CREATE INDEX IF NOT EXISTS idx_raw_hash ON raw_transactions(raw_hash);
+CREATE INDEX IF NOT EXISTS idx_raw_source_latest
+    ON raw_transactions(source_system, source_ledger_id, source_transaction_id, source_is_latest);
 
 -- ============================================================
 -- 2. normalized_transactions: 标准化交易
