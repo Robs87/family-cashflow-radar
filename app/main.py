@@ -8,7 +8,8 @@ import io
 import json
 import sqlite3
 import sys
-from datetime import date
+import threading
+from datetime import date, datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -71,6 +72,7 @@ DEFAULT_DB = Path("data/processed/cashflow.db")
 DEFAULT_RAW_INPUT = Path("data/raw")
 DEFAULT_BEECOUNT_CONFIG = Path("data/processed/beecount_source.json")
 DEFAULT_BEECOUNT_BASE_URL = "https://bee.332626.xyz:9090"
+DEFAULT_AUTO_SYNC_INTERVAL_MINUTES = 60.0
 SCHEMA_SQL = Path(__file__).resolve().parent / "db" / "schema.sql"
 SEED_RULES_SQL = Path(__file__).resolve().parent / "db" / "seed_rules.sql"
 FINANCIAL_TYPE_OPTIONS = [
@@ -737,6 +739,149 @@ def run_refresh_pipeline(
     return {"ok": all(step["ok"] for step in started_steps), "steps": started_steps}
 
 
+def _iso_timestamp() -> str:
+    return datetime.now().replace(microsecond=0).isoformat(sep=" ")
+
+
+def _pipeline_result_message(result: dict) -> str:
+    if not result.get("steps"):
+        return "同步未产生步骤"
+    failed = next((step for step in result["steps"] if not step.get("ok")), None)
+    if failed:
+        output = failed.get("stderr") or failed.get("stdout") or "无输出"
+        return f"{failed.get('label', '同步')} 失败：{output}"
+    labels = "、".join(str(step.get("label", "")) for step in result["steps"] if step.get("label"))
+    return f"同步完成：{labels}"
+
+
+def _new_auto_sync_state(enabled: bool, configured: bool, interval_minutes: float) -> dict:
+    return {
+        "enabled": enabled,
+        "configured": configured,
+        "interval_minutes": interval_minutes,
+        "running": False,
+        "run_count": 0,
+        "failure_count": 0,
+        "last_started_at": "",
+        "last_finished_at": "",
+        "last_ok": None,
+        "last_message": "等待首次自动同步" if enabled and configured else "",
+    }
+
+
+def _handler_beecount_source(handler_cls: type) -> dict:
+    return _resolve_beecount_source(
+        handler_cls.beecount_config_path,
+        handler_cls.beecount_input_json,
+        handler_cls.beecount_base_url,
+        handler_cls.beecount_ledger_id,
+        handler_cls.beecount_access_token_env,
+        handler_cls.beecount_refresh_token_env,
+        handler_cls.beecount_limit,
+    )
+
+
+def _run_refresh_pipeline_for_handler(handler_cls: type) -> dict:
+    return run_refresh_pipeline(
+        handler_cls.db_path,
+        handler_cls.raw_input_path,
+        beecount_config_path=handler_cls.beecount_config_path,
+        beecount_input_json=handler_cls.beecount_input_json,
+        beecount_base_url=handler_cls.beecount_base_url,
+        beecount_ledger_id=handler_cls.beecount_ledger_id,
+        beecount_access_token_env=handler_cls.beecount_access_token_env,
+        beecount_refresh_token_env=handler_cls.beecount_refresh_token_env,
+        beecount_limit=handler_cls.beecount_limit,
+    )
+
+
+def _run_auto_sync_once(handler_cls: type) -> dict:
+    state = getattr(handler_cls, "auto_sync_state", None)
+    if state is None:
+        state = _new_auto_sync_state(enabled=True, configured=True, interval_minutes=DEFAULT_AUTO_SYNC_INTERVAL_MINUTES)
+        handler_cls.auto_sync_state = state
+    if not state.get("enabled") or not state.get("configured"):
+        return state
+
+    if not handler_cls.sync_lock.acquire(blocking=False):
+        state.update(
+            {
+                "last_started_at": _iso_timestamp(),
+                "last_finished_at": _iso_timestamp(),
+                "last_ok": False,
+                "last_message": "上一次同步仍在运行，已跳过本轮自动同步",
+            }
+        )
+        return state
+
+    state.update({"running": True, "last_started_at": _iso_timestamp(), "last_message": "自动同步运行中"})
+    try:
+        result = _run_refresh_pipeline_for_handler(handler_cls)
+        ok = bool(result.get("ok"))
+        state["run_count"] = int(state.get("run_count") or 0) + 1
+        if not ok:
+            state["failure_count"] = int(state.get("failure_count") or 0) + 1
+        state.update(
+            {
+                "running": False,
+                "last_finished_at": _iso_timestamp(),
+                "last_ok": ok,
+                "last_message": _pipeline_result_message(result),
+            }
+        )
+    except Exception as exc:
+        state["run_count"] = int(state.get("run_count") or 0) + 1
+        state["failure_count"] = int(state.get("failure_count") or 0) + 1
+        state.update(
+            {
+                "running": False,
+                "last_finished_at": _iso_timestamp(),
+                "last_ok": False,
+                "last_message": f"自动同步异常：{type(exc).__name__}: {exc}",
+            }
+        )
+    finally:
+        handler_cls.sync_lock.release()
+    return state
+
+
+def _start_auto_sync_thread(handler_cls: type, interval_minutes: float) -> threading.Thread | None:
+    source = _handler_beecount_source(handler_cls)
+    configured = _beecount_source_configured(
+        source["beecount_input_json"],
+        source["beecount_base_url"],
+        source["beecount_ledger_id"],
+    )
+    if interval_minutes <= 0:
+        handler_cls.auto_sync_state = _new_auto_sync_state(
+            enabled=False,
+            configured=configured,
+            interval_minutes=interval_minutes,
+        )
+        return None
+    handler_cls.auto_sync_state = _new_auto_sync_state(
+        enabled=configured,
+        configured=configured,
+        interval_minutes=interval_minutes,
+    )
+    if not configured:
+        return None
+
+    interval_seconds = max(60.0, interval_minutes * 60.0)
+    stop_event = threading.Event()
+    handler_cls.auto_sync_stop_event = stop_event
+
+    def sync_loop() -> None:
+        while not stop_event.is_set():
+            _run_auto_sync_once(handler_cls)
+            stop_event.wait(interval_seconds)
+
+    thread = threading.Thread(target=sync_loop, name="beecount-auto-sync", daemon=True)
+    handler_cls.auto_sync_thread = thread
+    thread.start()
+    return thread
+
+
 def save_manual_override(
     db_path: Path,
     transaction_id: int,
@@ -1176,6 +1321,39 @@ def _render_pipeline_result(result: dict | None) -> str:
         f'<ol>{"".join(step_html)}</ol>'
         "</section>"
     )
+
+
+def _render_auto_sync_status(state: dict | None) -> str:
+    if not state:
+        return ""
+    if not state.get("enabled"):
+        text = "自动同步：未启用"
+        if not state.get("configured"):
+            text = "自动同步：未配置 BeeCount 来源"
+        return f'<div class="sync-status sync-muted">{html.escape(text)}</div>'
+
+    if state.get("running"):
+        tone = "sync-running"
+        status = "运行中"
+    elif state.get("last_ok") is True:
+        tone = "sync-ok"
+        status = "上次成功"
+    elif state.get("last_ok") is False:
+        tone = "sync-bad"
+        status = "上次失败"
+    else:
+        tone = "sync-muted"
+        status = "等待首次同步"
+
+    finished_at = state.get("last_finished_at") or state.get("last_started_at") or ""
+    interval = state.get("interval_minutes") or DEFAULT_AUTO_SYNC_INTERVAL_MINUTES
+    message = state.get("last_message") or ""
+    details = [f"每 {float(interval):g} 分钟", status]
+    if finished_at:
+        details.append(str(finished_at))
+    if message:
+        details.append(str(message))
+    return f'<div class="sync-status {tone}">{html.escape(" · ".join(details))}</div>'
 
 
 def _render_notice(notice: dict | None) -> str:
@@ -2073,6 +2251,7 @@ def render_dashboard_html(
     notice: dict | None = None,
     edit_template_id: int | None = None,
     edit_prepayment_id: int | None = None,
+    auto_sync_state: dict | None = None,
 ) -> str:
     _ensure_database_initialized(db_path)
     data = _fetch_dashboard_data(db_path)
@@ -2105,6 +2284,7 @@ def render_dashboard_html(
     legacy_pending_count = data["legacy_pending_count"]
     trend_html = _render_trend_bars(data["trend"])
     pipeline_html = _render_pipeline_result(pipeline_result)
+    auto_sync_html = _render_auto_sync_status(auto_sync_state)
     notice_html = _render_notice(notice)
     add_transaction_form_html = _render_add_transaction_form()
     recurring_forms_html = _render_recurring_forms()
@@ -2191,6 +2371,21 @@ def render_dashboard_html(
       gap: 10px;
       align-items: center;
     }}
+    .sync-status {{
+      max-width: 520px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 10px;
+      color: var(--muted);
+      background: #ffffff;
+      font-size: 12px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }}
+    .sync-ok {{ border-color: #b9dbc9; color: var(--green); }}
+    .sync-bad {{ border-color: #e5b9b9; color: var(--red); }}
+    .sync-running {{ border-color: #b8cee0; color: var(--blue); }}
+    .sync-muted {{ color: var(--muted); }}
     .secondary-action {{
       min-height: 38px;
       border: 1px solid var(--line);
@@ -2673,6 +2868,7 @@ def render_dashboard_html(
     <div class="wrap topbar">
       <h1>家庭现金流雷达</h1>
       <div class="actions">
+        {auto_sync_html}
         <a class="secondary-action" href="/settings/beecount">BeeCount 配置</a>
         <form method="post" action="/actions/refresh">
           <button type="submit">刷新数据</button>
@@ -2799,6 +2995,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     beecount_access_token_env = "BEECOUNT_ACCESS_TOKEN"
     beecount_refresh_token_env = "BEECOUNT_REFRESH_TOKEN"
     beecount_limit = 500
+    auto_sync_state: dict | None = None
+    auto_sync_thread: threading.Thread | None = None
+    auto_sync_stop_event: threading.Event | None = None
+    sync_lock = threading.Lock()
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -2837,6 +3037,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.db_path,
                 edit_template_id=edit_template_id,
                 edit_prepayment_id=edit_prepayment_id,
+                auto_sync_state=self.auto_sync_state,
             ).encode("utf-8")
             status = 200
         except sqlite3.Error as exc:
@@ -2852,19 +3053,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/actions/refresh":
-            result = run_refresh_pipeline(
-                self.db_path,
-                self.raw_input_path,
-                beecount_config_path=self.beecount_config_path,
-                beecount_input_json=self.beecount_input_json,
-                beecount_base_url=self.beecount_base_url,
-                beecount_ledger_id=self.beecount_ledger_id,
-                beecount_access_token_env=self.beecount_access_token_env,
-                beecount_refresh_token_env=self.beecount_refresh_token_env,
-                beecount_limit=self.beecount_limit,
-            )
+            with self.sync_lock:
+                result = _run_refresh_pipeline_for_handler(type(self))
             try:
-                body = render_dashboard_html(self.db_path, pipeline_result=result).encode("utf-8")
+                body = render_dashboard_html(
+                    self.db_path,
+                    pipeline_result=result,
+                    auto_sync_state=self.auto_sync_state,
+                ).encode("utf-8")
                 status = 200
             except sqlite3.Error as exc:
                 body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
@@ -3242,6 +3438,7 @@ def run_server(
     beecount_access_token_env: str = "BEECOUNT_ACCESS_TOKEN",
     beecount_refresh_token_env: str = "BEECOUNT_REFRESH_TOKEN",
     beecount_limit: int = 500,
+    auto_sync_interval_minutes: float = DEFAULT_AUTO_SYNC_INTERVAL_MINUTES,
 ) -> None:
     DashboardHandler.db_path = db_path
     DashboardHandler.raw_input_path = input_path
@@ -3252,6 +3449,7 @@ def run_server(
     DashboardHandler.beecount_access_token_env = beecount_access_token_env
     DashboardHandler.beecount_refresh_token_env = beecount_refresh_token_env
     DashboardHandler.beecount_limit = beecount_limit
+    DashboardHandler.sync_lock = threading.Lock()
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print(f"Using database: {db_path}")
@@ -3278,7 +3476,17 @@ def run_server(
             )
     else:
         print(f"Using CSV input: {input_path}")
-    server.serve_forever()
+    auto_sync_thread = _start_auto_sync_thread(DashboardHandler, auto_sync_interval_minutes)
+    if auto_sync_thread:
+        print(f"BeeCount auto sync enabled: every {auto_sync_interval_minutes:g} minutes")
+    else:
+        print("BeeCount auto sync disabled")
+    try:
+        server.serve_forever()
+    finally:
+        if DashboardHandler.auto_sync_stop_event:
+            DashboardHandler.auto_sync_stop_event.set()
+        server.server_close()
 
 
 def main() -> None:
@@ -3292,6 +3500,13 @@ def main() -> None:
     parser.add_argument("--beecount-access-token-env", default="BEECOUNT_ACCESS_TOKEN", help="BeeCount access token 环境变量名")
     parser.add_argument("--beecount-refresh-token-env", default="BEECOUNT_REFRESH_TOKEN", help="BeeCount refresh token 环境变量名")
     parser.add_argument("--beecount-limit", type=int, default=500, help="BeeCount read API 单次读取上限")
+    parser.add_argument(
+        "--auto-sync-interval-minutes",
+        type=float,
+        default=DEFAULT_AUTO_SYNC_INTERVAL_MINUTES,
+        help="BeeCount 自动同步间隔分钟数；设为 0 可关闭",
+    )
+    parser.add_argument("--no-auto-sync", action="store_true", help="关闭 BeeCount 自动同步")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址")
     parser.add_argument("--port", type=int, default=8000, help="监听端口")
     args = parser.parse_args()
@@ -3307,6 +3522,7 @@ def main() -> None:
         beecount_access_token_env=args.beecount_access_token_env,
         beecount_refresh_token_env=args.beecount_refresh_token_env,
         beecount_limit=args.beecount_limit,
+        auto_sync_interval_minutes=0 if args.no_auto_sync else args.auto_sync_interval_minutes,
     )
 
 

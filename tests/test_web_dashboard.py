@@ -15,8 +15,11 @@ from app.main import (
     DashboardHandler,
     _build_cashflow_signal,
     _build_financial_advice,
+    _new_auto_sync_state,
     _resolve_beecount_source,
     _format_yuan,
+    _render_auto_sync_status,
+    _run_auto_sync_once,
     render_beecount_settings_html,
     render_dashboard_html,
     run_refresh_pipeline,
@@ -118,6 +121,24 @@ class TestRenderDashboard:
         assert "最近模拟结果" in html
         assert "本月稳定收入" in html
         assert "20,000.00 元" in html
+
+    def test_renders_auto_sync_status(self, db_with_dashboard_data):
+        html = render_dashboard_html(
+            db_with_dashboard_data,
+            auto_sync_state={
+                "enabled": True,
+                "configured": True,
+                "interval_minutes": 60,
+                "running": False,
+                "last_ok": True,
+                "last_finished_at": "2026-05-22 20:30:00",
+                "last_message": "同步完成：同步 BeeCount、标准化交易",
+            },
+        )
+
+        assert "每 60 分钟" in html
+        assert "上次成功" in html
+        assert "同步完成：同步 BeeCount、标准化交易" in html
         assert "本月刚性支出" in html
         assert "2,000.00 元" in html
         assert "本月债务还款" in html
@@ -580,6 +601,109 @@ class TestRefreshPipeline:
         assert len(result["steps"]) == 1
         assert result["steps"][0]["label"] == "导入 CSV"
         assert "输入路径不存在" in result["steps"][0]["stderr"]
+
+
+class TestAutoSync:
+    def test_auto_sync_once_runs_refresh_pipeline_and_updates_state(self, db_path, monkeypatch):
+        calls = []
+
+        def fake_pipeline(*args, **kwargs):
+            calls.append((args, kwargs))
+            return {
+                "ok": True,
+                "steps": [
+                    {"label": "同步 BeeCount", "ok": True, "stdout": "imported=1", "stderr": ""},
+                    {"label": "标准化交易", "ok": True, "stdout": "normalized=1", "stderr": ""},
+                ],
+            }
+
+        monkeypatch.setattr("app.main.run_refresh_pipeline", fake_pipeline)
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {
+                "db_path": db_path,
+                "raw_input_path": FIXTURES_DIR,
+                "beecount_input_json": FIXTURES_DIR / "sample_beecount_transactions.json",
+                "beecount_config_path": None,
+                "sync_lock": threading.Lock(),
+                "auto_sync_state": _new_auto_sync_state(True, True, 60),
+            },
+        )
+
+        state = _run_auto_sync_once(TestHandler)
+
+        assert len(calls) == 1
+        assert calls[0][0][0] == db_path
+        assert state["last_ok"] is True
+        assert state["run_count"] == 1
+        assert "同步完成" in state["last_message"]
+
+    def test_auto_sync_once_records_pipeline_failure(self, db_path, monkeypatch):
+        def fake_pipeline(*args, **kwargs):
+            return {
+                "ok": False,
+                "steps": [
+                    {
+                        "label": "同步 BeeCount",
+                        "ok": False,
+                        "stdout": "",
+                        "stderr": "refresh token 已失效",
+                    }
+                ],
+            }
+
+        monkeypatch.setattr("app.main.run_refresh_pipeline", fake_pipeline)
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {
+                "db_path": db_path,
+                "raw_input_path": FIXTURES_DIR,
+                "beecount_input_json": FIXTURES_DIR / "sample_beecount_transactions.json",
+                "beecount_config_path": None,
+                "sync_lock": threading.Lock(),
+                "auto_sync_state": _new_auto_sync_state(True, True, 60),
+            },
+        )
+
+        state = _run_auto_sync_once(TestHandler)
+
+        assert state["last_ok"] is False
+        assert state["failure_count"] == 1
+        assert "refresh token 已失效" in state["last_message"]
+
+    def test_auto_sync_once_skips_when_refresh_lock_is_busy(self, db_path, monkeypatch):
+        def fake_pipeline(*args, **kwargs):
+            raise AssertionError("pipeline should not run while lock is busy")
+
+        lock = threading.Lock()
+        lock.acquire()
+        monkeypatch.setattr("app.main.run_refresh_pipeline", fake_pipeline)
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {
+                "db_path": db_path,
+                "raw_input_path": FIXTURES_DIR,
+                "beecount_input_json": FIXTURES_DIR / "sample_beecount_transactions.json",
+                "beecount_config_path": None,
+                "sync_lock": lock,
+                "auto_sync_state": _new_auto_sync_state(True, True, 60),
+            },
+        )
+        try:
+            state = _run_auto_sync_once(TestHandler)
+        finally:
+            lock.release()
+
+        assert state["last_ok"] is False
+        assert "已跳过" in state["last_message"]
+
+    def test_render_auto_sync_status_when_disabled_without_beecount_source(self):
+        html = _render_auto_sync_status(_new_auto_sync_state(False, False, 60))
+
+        assert "自动同步：未配置 BeeCount 来源" in html
 
 
 class TestManualOverride:
