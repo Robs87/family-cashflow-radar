@@ -2,6 +2,14 @@
 
 本仓库是用户的本地家庭现金流分析项目。最新目标是把 BeeCount Cloud 作为流水记录和同步层，本项目负责把账本流水翻译成家庭现金流分析和决策系统。
 
+当前事实源文档：
+
+- 产品需求：`docs/prd/prd-v0.2.md`
+- 当前实施计划：`docs/plans/v0.2-action-advice-plan.md`
+- BeeCount 数据源计划：`docs/plans/v0.3-beecount-cloud-source-plan.md`
+
+`docs/plans/mvp-implementation-plan-v0.2-beecount-mcp.md` 已废弃，仅作历史参考；不要按其中 MCP cache、全新 planned events schema、CLI-first 的严格顺序施工。
+
 ## 0. 核心边界
 
 代码施工默认交给 Claude Code。其他代理可以评审、QA、整理文档，但仓库代码改动必须遵守本文件。
@@ -219,12 +227,12 @@ tests/fixtures/sample_pixiu_2021_2022.csv
 当前推荐顺序：
 
 ```text
-Task 1：明确 BeeCount Cloud 数据源契约和权限边界
-Task 2：实现 BeeCount 交易只读同步到 raw_transactions
-Task 3：复用 normalize / classify / monthly_cashflow
-Task 4：保留 CSV 迁移通道，但不再强化为日常入口
-Task 5：首页现金流安全判断和近期建议
-Task 6：提前还贷、大额消费、买车、投资仓位模拟
+Task 1：补齐 BeeCount 交易更新 / 删除 / 最新版本选择语义
+Task 2：实现当前现金余额校准
+Task 3：实现未来计划事件和实际 BeeCount 流水匹配去重
+Task 4：继续完善大额消费 / 买车分期成本模拟
+Task 5：实现投资仓位安全上限
+Task 6：持续优化 BeeCount 分类映射和支出控制建议
 ```
 
 任何 BeeCount 写入能力必须谨慎处理。默认只读；如未来接入写入，必须由用户显式授权，并且不得绕过 BeeCount 的审计和确认机制。

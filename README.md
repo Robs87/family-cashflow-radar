@@ -117,11 +117,15 @@ python3 app/scripts/print_summary.py --db data/processed/cashflow.db
 
 ## 当前文档
 
-- [PRD v0.1](docs/prd/prd-v0.1.md)
-- [PRD v0.2](docs/prd/prd-v0.2.md)
+- [PRD v0.2](docs/prd/prd-v0.2.md)：当前产品需求事实源。
+- [v0.2 实施计划](docs/plans/v0.2-action-advice-plan.md)：当前开发计划事实源。
 - [BeeCount Cloud 数据源适配计划 v0.3](docs/plans/v0.3-beecount-cloud-source-plan.md)
+- [项目日志](docs/logs/project-log.md)
+
+## 历史文档
+
+- [PRD v0.1](docs/prd/prd-v0.1.md)
 - [数据库 Schema 与自动分类规则 v0.1](docs/design/database-schema-and-classification-rules-v0.1.md)
 - [MVP 实施计划 v0.1](docs/plans/mvp-implementation-plan-v0.1.md)
-- [v0.2 实施计划](docs/plans/v0.2-action-advice-plan.md)
+- [MVP 实施计划 v0.2 - BeeCount MCP](docs/plans/mvp-implementation-plan-v0.2-beecount-mcp.md)：已废弃，仅作历史参考。
 - [v0.2 更新摘要](docs/logs/2026-05-17-v0.2-update-summary.md)
-- [项目日志](docs/logs/project-log.md)

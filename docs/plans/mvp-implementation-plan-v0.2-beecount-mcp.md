@@ -2,11 +2,15 @@
 title: 家庭现金流雷达 MVP 实施计划 v0.2 - BeeCount MCP
 type: implementation-plan
 created: 2026-05-18
-updated: 2026-05-18
-status: draft
+updated: 2026-05-22
+status: superseded
 ---
 
 # 家庭现金流雷达 MVP 实施计划 v0.2 - BeeCount MCP
+
+> 状态：历史参考，已被 `docs/prd/prd-v0.2.md`、`docs/plans/v0.2-action-advice-plan.md` 和 `docs/plans/v0.3-beecount-cloud-source-plan.md` 取代。
+>
+> 取代原因：本文件以 BeeCount MCP cache、全新 planned events schema 和“CLI 完成后再做 Web”为主线；当前项目已经转为 BeeCount read API / `raw_transactions` 镜像 / 现有 Web 分析层演进。后续施工不要按本文件的严格任务顺序执行。
 
 > 后续仓库代码改动默认交给 Claude Code 执行。本计划把 v0.1 的 CSV 主线调整为 BeeCount Cloud MCP 事实源 + 家庭现金流计划层。
 
