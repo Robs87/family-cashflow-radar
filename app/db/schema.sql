@@ -268,6 +268,39 @@ CREATE INDEX IF NOT EXISTS idx_cash_balance_latest
     ON cash_balance_calibrations(calibration_date DESC, id DESC);
 
 -- ============================================================
+-- 7.2. planned_cashflow_events: 未来计划现金流事件
+-- ============================================================
+CREATE TABLE IF NOT EXISTS planned_cashflow_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_name TEXT NOT NULL,
+    event_date TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+    cashflow_direction TEXT NOT NULL CHECK(cashflow_direction IN ('inflow', 'outflow')),
+    financial_type TEXT NOT NULL CHECK(financial_type IN (
+        'stable_income', 'one_time_income', 'living_expense', 'fixed_expense',
+        'debt_payment', 'debt_inflow', 'asset_purchase', 'asset_sale',
+        'investment_outflow', 'investment_inflow', 'refund',
+        'reimbursable_expense', 'reimbursement_income', 'unknown'
+    )),
+    category_l1 TEXT DEFAULT '',
+    category_l2 TEXT DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    match_status TEXT NOT NULL DEFAULT 'unmatched' CHECK(match_status IN ('unmatched', 'matched', 'ignored')),
+    matched_normalized_transaction_id INTEGER UNIQUE,
+    matched_raw_transaction_id INTEGER UNIQUE,
+    match_confidence REAL DEFAULT 0,
+    matched_at TEXT,
+    note TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(matched_normalized_transaction_id) REFERENCES normalized_transactions(id),
+    FOREIGN KEY(matched_raw_transaction_id) REFERENCES raw_transactions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_planned_events_active_date
+    ON planned_cashflow_events(enabled, match_status, event_date);
+
+-- ============================================================
 -- 8. decision_scenarios: 决策模拟
 -- ============================================================
 CREATE TABLE IF NOT EXISTS decision_scenarios (

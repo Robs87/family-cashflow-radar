@@ -43,6 +43,12 @@ from app.scripts.generate_monthly_cashflow import generate_monthly_cashflow
 from app.scripts.import_beecount import import_beecount
 from app.scripts.import_csv import import_csv
 from app.scripts.normalize import normalize
+from app.scripts.planned_events import (
+    create_planned_event,
+    match_planned_events,
+    parse_yuan_to_cents as parse_planned_event_yuan_to_cents,
+    validate_date as validate_planned_event_date,
+)
 from app.scripts.recurring import (
     add_mortgage_prepayment,
     create_fixed_bill_template,
@@ -401,6 +407,14 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
                ORDER BY id DESC
                LIMIT 6"""
         ).fetchall()
+        planned_events = conn.execute(
+            """SELECT id, event_name, event_date, amount_cents, cashflow_direction,
+                      financial_type, category_l1, category_l2, enabled, match_status,
+                      match_confidence, note
+               FROM planned_cashflow_events
+               ORDER BY enabled DESC, match_status ASC, event_date ASC, id DESC
+               LIMIT 8"""
+        ).fetchall()
         cash_balance = latest_cash_balance(conn)
     finally:
         conn.close()
@@ -426,6 +440,7 @@ def _fetch_dashboard_data(db_path: Path) -> dict:
         "debt_split_summary": dict(debt_split_summary) if debt_split_summary else {},
         "prepayment_events": [dict(row) for row in prepayment_events],
         "decision_scenarios": [dict(row) for row in decision_scenarios],
+        "planned_events": [dict(row) for row in planned_events],
         "cash_balance": cash_balance.__dict__ if cash_balance else None,
     }
 
@@ -1012,6 +1027,42 @@ def save_current_cash_balance(
     return {"ok": True, "message": f"现金余额已校准: #{calibration_id}"}
 
 
+def save_planned_cashflow_event(
+    db_path: Path,
+    event_name: str,
+    event_date: str,
+    amount_yuan: str,
+    cashflow_direction: str,
+    financial_type: str,
+    category_l1: str = "",
+    category_l2: str = "",
+    note: str = "",
+) -> dict:
+    try:
+        event_id = create_planned_event(
+            db_path,
+            event_name,
+            validate_planned_event_date(event_date),
+            parse_planned_event_yuan_to_cents(amount_yuan),
+            cashflow_direction,
+            financial_type,
+            category_l1=category_l1,
+            category_l2=category_l2,
+            note=note,
+        )
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+    return {"ok": True, "message": f"计划事件已保存: #{event_id}"}
+
+
+def run_planned_event_matching(db_path: Path) -> dict:
+    try:
+        summary = match_planned_events(db_path)
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+    return {"ok": True, "message": f"计划事件匹配完成: {summary}"}
+
+
 def save_decision_simulation(
     db_path: Path,
     scenario_name: str,
@@ -1022,6 +1073,8 @@ def save_decision_simulation(
     *,
     installment_months_text: str = "",
     monthly_payment_yuan: str = "",
+    expected_income_impact_yuan: str = "",
+    expected_expense_impact_yuan: str = "",
     mortgage_template_id_text: str = "",
     mortgage_effect_type: str = "reduce_term",
 ) -> dict:
@@ -1036,6 +1089,16 @@ def save_decision_simulation(
         monthly_payment_cents = (
             parse_simulation_yuan_to_cents(monthly_payment_yuan) if monthly_payment_yuan.strip() else None
         )
+        expected_income_impact_cents = (
+            parse_simulation_yuan_to_cents(expected_income_impact_yuan)
+            if expected_income_impact_yuan.strip()
+            else 0
+        )
+        expected_expense_impact_cents = (
+            parse_simulation_yuan_to_cents(expected_expense_impact_yuan)
+            if expected_expense_impact_yuan.strip()
+            else 0
+        )
         mortgage_template_id = int(mortgage_template_id_text) if mortgage_template_id_text.strip() else None
         scenario_id, simulation = save_decision_scenario(
             db_path,
@@ -1046,6 +1109,8 @@ def save_decision_simulation(
             payment_type=payment_type,
             installment_months=installment_months,
             monthly_payment_cents=monthly_payment_cents,
+            expected_income_impact_cents=expected_income_impact_cents,
+            expected_expense_impact_cents=expected_expense_impact_cents,
             mortgage_template_id=mortgage_template_id,
             mortgage_effect_type=mortgage_effect_type,
         )
@@ -1671,6 +1736,8 @@ def _render_decision_simulator_form(mortgage_templates: list[dict]) -> str:
         f'<label>支付方式<select name="payment_type">{payment_options}</select></label>'
         '<label>分期月数<input type="number" name="installment_months" min="1" step="1" placeholder="可选"></label>'
         '<label>月供<input type="number" name="monthly_payment_yuan" min="0" step="0.01" placeholder="可选"></label>'
+        '<label>收入影响<input type="number" name="expected_income_impact_yuan" min="0" step="0.01" placeholder="每月可选"></label>'
+        '<label>新增支出<input type="number" name="expected_expense_impact_yuan" min="0" step="0.01" placeholder="每月可选"></label>'
         f'<label>房贷<select name="mortgage_template_id">{mortgage_options}</select></label>'
         f'<label>提前还贷方式<select name="mortgage_effect_type">{effect_options}</select></label>'
         '<button type="submit">保存模拟</button>'
@@ -1712,6 +1779,51 @@ def _render_decision_scenarios(rows: list[dict]) -> str:
             f'<span>{html.escape(row.get("explanation") or "")}</span>'
             "</div>"
             f'<b class="amount amount-outflow">{html.escape(amount)} 元</b>'
+            "</div>"
+        )
+    return "\n".join(parts)
+
+
+def _render_planned_event_form() -> str:
+    today = date.today().isoformat()
+    direction_options = _render_options([("inflow", "未来收入"), ("outflow", "未来支出")], "outflow")
+    type_options = _render_options(FINANCIAL_TYPE_OPTIONS, "one_time_income")
+    return (
+        '<form class="entry-form compact-form" method="post" action="/actions/planned-event">'
+        '<h3>未来计划事件</h3>'
+        '<label>名称<input name="event_name" placeholder="例如：年终奖 / 买车首付" required></label>'
+        f'<label>日期<input type="date" name="event_date" value="{html.escape(today)}" required></label>'
+        '<label>金额<input type="number" name="amount_yuan" min="0" step="0.01" placeholder="50000" required></label>'
+        f'<label>方向<select name="cashflow_direction">{direction_options}</select></label>'
+        f'<label>类型<select name="financial_type">{type_options}</select></label>'
+        '<label>一级分类<input name="category_l1" placeholder="可选"></label>'
+        '<label>二级分类<input name="category_l2" placeholder="可选"></label>'
+        '<label class="entry-wide">备注<input name="note" placeholder="可选"></label>'
+        '<button type="submit">保存计划</button>'
+        "</form>"
+    )
+
+
+def _render_planned_events(rows: list[dict]) -> str:
+    match_button = (
+        '<form class="generate-form" method="post" action="/actions/match-planned-events">'
+        '<button type="submit">匹配 BeeCount 实际流水</button>'
+        "</form>"
+    )
+    if not rows:
+        return match_button + '<p class="empty">暂无未来计划事件</p>'
+    parts = [match_button]
+    for row in rows:
+        direction_class = "amount-inflow" if row["cashflow_direction"] == "inflow" else "amount-outflow"
+        status = "已匹配" if row["match_status"] == "matched" else ("已停用" if not row["enabled"] else "待匹配")
+        parts.append(
+            '<div class="list-row">'
+            '<div class="list-main">'
+            f'<strong>{html.escape(row["event_date"])} · {html.escape(row["event_name"])}</strong>'
+            f'<span>{html.escape(status)} · {html.escape(_financial_type_label(row["financial_type"]))} · '
+            f'{html.escape(row.get("category_l2") or row.get("category_l1") or "未分类")}</span>'
+            "</div>"
+            f'<b class="amount {direction_class}">{html.escape(_format_yuan(row["amount_cents"]))} 元</b>'
             "</div>"
         )
     return "\n".join(parts)
@@ -1998,6 +2110,7 @@ def render_dashboard_html(
     recurring_forms_html = _render_recurring_forms()
     mortgage_prepayment_form_html = _render_mortgage_prepayment_form(data["mortgage_templates"])
     decision_simulator_form_html = _render_decision_simulator_form(data["mortgage_templates"])
+    planned_event_form_html = _render_planned_event_form()
     cash_balance_form_html = _render_cash_balance_form(data["cash_balance"], latest)
     advice_html = _render_financial_advice(data)
     recent_transactions_html = _render_recent_transactions(data["recent_transactions"])
@@ -2012,6 +2125,7 @@ def render_dashboard_html(
     debt_split_summary_html = _render_debt_split_summary(data["debt_split_summary"])
     prepayment_events_html = _render_prepayment_events(data["prepayment_events"])
     decision_scenarios_html = _render_decision_scenarios(data["decision_scenarios"])
+    planned_events_html = _render_planned_events(data["planned_events"])
     edit_prepayment = next(
         (row for row in data["prepayment_events"] if edit_prepayment_id and int(row["id"]) == edit_prepayment_id),
         None,
@@ -2588,6 +2702,7 @@ def render_dashboard_html(
         {recurring_forms_html}
         {mortgage_prepayment_form_html}
         {decision_simulator_form_html}
+        {planned_event_form_html}
       </div>
       <div class="panel">
         <h2>周期账单</h2>
@@ -2653,6 +2768,18 @@ def render_dashboard_html(
         <div class="breakdown-list">
           {decision_scenarios_html}
         </div>
+      </div>
+    </section>
+    <section class="grid">
+      <div class="panel">
+        <h2>未来计划事件</h2>
+        <div class="breakdown-list">
+          {planned_events_html}
+        </div>
+      </div>
+      <div class="panel">
+        <h2>下一步决策</h2>
+        <p class="empty">计划事件匹配后，大额消费、买车和投资模拟会自动避开重复计算。</p>
       </div>
     </section>
     {prepayment_edit_html}
@@ -2824,6 +2951,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 status = 500
         elif parsed.path == "/actions/cash-balance":
             notice = self._handle_cash_balance()
+            try:
+                body = render_dashboard_html(self.db_path, notice=notice).encode("utf-8")
+                status = 200 if notice["ok"] else 400
+            except sqlite3.Error as exc:
+                body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
+                status = 500
+        elif parsed.path == "/actions/planned-event":
+            notice = self._handle_planned_event()
+            try:
+                body = render_dashboard_html(self.db_path, notice=notice).encode("utf-8")
+                status = 200 if notice["ok"] else 400
+            except sqlite3.Error as exc:
+                body = f"数据库读取失败: {html.escape(str(exc))}".encode("utf-8")
+                status = 500
+        elif parsed.path == "/actions/match-planned-events":
+            notice = self._handle_match_planned_events()
             try:
                 body = render_dashboard_html(self.db_path, notice=notice).encode("utf-8")
                 status = 200 if notice["ok"] else 400
@@ -3015,6 +3158,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             fields.get("payment_type", [""])[0],
             installment_months_text=fields.get("installment_months", [""])[0],
             monthly_payment_yuan=fields.get("monthly_payment_yuan", [""])[0],
+            expected_income_impact_yuan=fields.get("expected_income_impact_yuan", [""])[0],
+            expected_expense_impact_yuan=fields.get("expected_expense_impact_yuan", [""])[0],
             mortgage_template_id_text=fields.get("mortgage_template_id", [""])[0],
             mortgage_effect_type=fields.get("mortgage_effect_type", ["reduce_term"])[0],
         )
@@ -3030,6 +3175,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             scope=fields.get("scope", [""])[0],
             note=fields.get("note", [""])[0],
         )
+
+    def _handle_planned_event(self) -> dict:
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        raw_body = self.rfile.read(content_length).decode("utf-8")
+        fields = parse_qs(raw_body)
+        return save_planned_cashflow_event(
+            self.db_path,
+            fields.get("event_name", [""])[0],
+            fields.get("event_date", [""])[0],
+            fields.get("amount_yuan", [""])[0],
+            fields.get("cashflow_direction", [""])[0],
+            fields.get("financial_type", [""])[0],
+            category_l1=fields.get("category_l1", [""])[0],
+            category_l2=fields.get("category_l2", [""])[0],
+            note=fields.get("note", [""])[0],
+        )
+
+    def _handle_match_planned_events(self) -> dict:
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        self.rfile.read(content_length)
+        return run_planned_event_matching(self.db_path)
 
     def _handle_beecount_token_config(self) -> dict:
         content_length = int(self.headers.get("Content-Length", "0") or 0)

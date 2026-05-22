@@ -16,6 +16,7 @@ EXPECTED_TABLES = {
     "debts",
     "cashflow_forecast",
     "cash_balance_calibrations",
+    "planned_cashflow_events",
     "decision_scenarios",
     "recurring_bill_templates",
     "mortgage_repayment_schedule",
@@ -80,6 +81,13 @@ def test_cash_balance_calibrations_uses_integer_cents(db_conn):
     cols = _get_column_types(db_conn, "cash_balance_calibrations")
     assert cols["available_cash_cents"] == "INTEGER"
     assert cols["calibration_date"] == "TEXT"
+
+
+def test_planned_cashflow_events_uses_integer_cents(db_conn):
+    cols = _get_column_types(db_conn, "planned_cashflow_events")
+    assert cols["amount_cents"] == "INTEGER"
+    assert cols["match_status"] == "TEXT"
+    assert cols["matched_normalized_transaction_id"] == "INTEGER"
 
 
 def test_no_real_amount_in_normalized(db_conn):

@@ -13,6 +13,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.scripts.cash_balance import latest_cash_balance
+from app.scripts.planned_events import forecast_events_by_month
 from app.scripts.recurring import build_equal_payment_schedule, build_fixed_payment_schedule
 from app.scripts.schema_migrations import ensure_v02_schema
 
@@ -228,6 +229,7 @@ def simulate_decision(
         ensure_v02_schema(conn)
         latest = _latest_month(conn)
         cash_balance = latest_cash_balance(conn)
+        planned_by_month = forecast_events_by_month(conn, start_month, horizon_months)
         interest_savings_cents, term_months_delta, mortgage_detail = (
             _estimate_mortgage_prepayment_savings(
                 conn,
@@ -267,7 +269,9 @@ def simulate_decision(
             monthly_payment_cents=monthly_payment_cents,
             month=month,
         )
+        planned_net = planned_by_month.get(month, 0)
         monthly_net = base_net + expected_income_impact_cents - expected_expense_impact_cents - scenario_outflow
+        monthly_net += planned_net
         opening_buffer += monthly_net
         safety_months = opening_buffer / required_outflow if required_outflow > 0 else 99.0
         balances.append((month, opening_buffer, safety_months))
@@ -275,6 +279,28 @@ def simulate_decision(
             min_balance = opening_buffer
             risk_month = month
         min_safety = min(min_safety, safety_months)
+
+    target_buffer = int(required_outflow * 3)
+    projected_without_decision = (
+        (
+            int(cash_balance.available_cash_cents)
+            if cash_balance is not None
+            else max(base_net, 0)
+        )
+        + sum(
+            base_net
+            + expected_income_impact_cents
+            - expected_expense_impact_cents
+            + planned_by_month.get(_month_add(start_month, index), 0)
+            for index in range(horizon_months)
+        )
+    )
+    if decision_type == "investment":
+        suggested_max = max(0, (int(cash_balance.available_cash_cents) if cash_balance is not None else max(base_net, 0)) - target_buffer)
+    else:
+        suggested_max = max(0, projected_without_decision - target_buffer)
+    if payment_type == "installment" and installment_months:
+        suggested_max = min(suggested_max, (max(base_net - expected_expense_impact_cents, 0) * installment_months))
 
     if min_balance < 0:
         risk_level = "danger"
@@ -289,19 +315,30 @@ def simulate_decision(
         risk_level = "safe"
         recommendation = "现金流压力可控，可以进入下一步决策比较。"
 
-    target_buffer = int(required_outflow * 3)
-    projected_without_decision = max(base_net, 0) + (base_net + expected_income_impact_cents - expected_expense_impact_cents) * horizon_months
-    suggested_max = max(0, projected_without_decision - target_buffer)
-    if payment_type == "installment" and installment_months:
-        suggested_max = min(suggested_max, (max(base_net, 0) * installment_months))
+    if decision_type == "investment" and amount_cents > suggested_max:
+        if risk_level == "safe":
+            risk_level = "watch"
+        recommendation = "建议降低加仓金额或暂缓：先保留 3 个月固定支出和债务还款现金垫。"
 
     detail = f"{horizon_months} 个月内最低安全垫 {format_yuan(max(min_balance, 0))} 元，最低覆盖 {min_safety:.1f} 个月。"
     if min_balance < 0:
         detail = f"{horizon_months} 个月内最低缺口 {format_yuan(min_balance)} 元，风险月份 {risk_month}。"
+    if any(planned_by_month.values()):
+        detail += " 已纳入未匹配的未来计划现金流，已匹配 BeeCount 实际流水的计划不会重复计算。"
     if decision_type == "mortgage_prepayment":
         detail += mortgage_detail
+    elif decision_type == "large_purchase":
+        if payment_type == "installment":
+            detail += " 已按分期现金流测算。"
+        if expected_expense_impact_cents:
+            detail += f" 已计入每月新增固定支出 {format_yuan(expected_expense_impact_cents)} 元。"
+        if expected_income_impact_cents:
+            detail += f" 已计入每月新增收入 {format_yuan(expected_income_impact_cents)} 元。"
     elif decision_type == "investment":
-        detail += " 当前不预测投资收益，只按本金占用现金流处理。"
+        detail += (
+            f" 当前不预测投资收益，只按本金占用现金流处理；必须保留现金 "
+            f"{format_yuan(target_buffer)} 元，可投资现金上限约 {format_yuan(max(suggested_max, 0))} 元。"
+        )
 
     return DecisionSimulation(
         risk_level=risk_level,
@@ -386,6 +423,8 @@ def main() -> None:
     parser.add_argument("--payment-type", choices=sorted(PAYMENT_TYPES), default="one_time")
     parser.add_argument("--installment-months", type=int)
     parser.add_argument("--monthly-payment", help="月供，单位元；留空则按总额/月数估算")
+    parser.add_argument("--expected-income-impact", default="0", help="每月新增收入影响，单位元")
+    parser.add_argument("--expected-expense-impact", default="0", help="每月新增固定支出影响，单位元")
     parser.add_argument("--mortgage-template-id", type=int)
     parser.add_argument("--mortgage-effect-type", choices=sorted(MORTGAGE_EFFECT_TYPES), default="reduce_term")
     args = parser.parse_args()
@@ -393,6 +432,8 @@ def main() -> None:
     try:
         amount_cents = parse_yuan_to_cents(args.amount)
         monthly_payment_cents = parse_yuan_to_cents(args.monthly_payment) if args.monthly_payment else None
+        expected_income_impact_cents = parse_yuan_to_cents(args.expected_income_impact)
+        expected_expense_impact_cents = parse_yuan_to_cents(args.expected_expense_impact)
         scenario_id, result = save_decision_scenario(
             args.db,
             args.name,
@@ -402,6 +443,8 @@ def main() -> None:
             payment_type=args.payment_type,
             installment_months=args.installment_months,
             monthly_payment_cents=monthly_payment_cents,
+            expected_income_impact_cents=expected_income_impact_cents,
+            expected_expense_impact_cents=expected_expense_impact_cents,
             mortgage_template_id=args.mortgage_template_id,
             mortgage_effect_type=args.mortgage_effect_type,
         )

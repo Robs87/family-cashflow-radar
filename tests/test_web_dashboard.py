@@ -21,6 +21,7 @@ from app.main import (
     render_dashboard_html,
     run_refresh_pipeline,
     run_recurring_generation,
+    run_planned_event_matching,
     save_beecount_token_config,
     save_beecount_category_mapping,
     save_current_cash_balance,
@@ -30,6 +31,7 @@ from app.main import (
     save_mortgage_template,
     save_mortgage_prepayment,
     save_new_transaction,
+    save_planned_cashflow_event,
     update_saved_fixed_bill_template,
     update_saved_mortgage_template,
     update_saved_mortgage_prepayment,
@@ -858,6 +860,30 @@ class TestRecurringWebActions:
         assert "150,000.00 元" in html
         assert "覆盖固定支出和债务还款约 30.0 个月" in html
 
+    def test_save_planned_cashflow_event_renders_list(self, db_path):
+        result = save_planned_cashflow_event(
+            db_path,
+            "奖金到账",
+            "2026-06-20",
+            "50000",
+            "inflow",
+            "one_time_income",
+            category_l2="奖金",
+        )
+
+        assert result == {"ok": True, "message": "计划事件已保存: #1"}
+        html = render_dashboard_html(db_path)
+        assert "未来计划事件" in html
+        assert "奖金到账" in html
+        assert "50,000.00 元" in html
+
+    def test_run_planned_event_matching_returns_summary(self, db_path):
+        save_planned_cashflow_event(db_path, "奖金到账", "2026-06-20", "50000", "inflow", "one_time_income")
+
+        result = run_planned_event_matching(db_path)
+
+        assert result == {"ok": True, "message": "计划事件匹配完成: matched=0 scanned=1"}
+
     def test_save_decision_simulation_includes_mortgage_interest_savings(self, db_path):
         conn = sqlite3.connect(str(db_path))
         conn.execute(
@@ -1222,6 +1248,44 @@ class TestHttpHandler:
         count = conn.execute("SELECT COUNT(*) FROM cash_balance_calibrations").fetchone()[0]
         conn.close()
         assert count == 1
+
+    def test_post_planned_event(self, db_path):
+        TestHandler = type(
+            "TestHandler",
+            (DashboardHandler,),
+            {"db_path": db_path, "raw_input_path": FIXTURES_DIR, "beecount_config_path": None},
+        )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            data = urlencode(
+                {
+                    "event_name": "买车首付",
+                    "event_date": "2026-06-20",
+                    "amount_yuan": "80000",
+                    "cashflow_direction": "outflow",
+                    "financial_type": "asset_purchase",
+                    "category_l2": "买车",
+                }
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/actions/planned-event",
+                data=data,
+                method="POST",
+            )
+            request.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert response.status == 200
+        assert "计划事件已保存" in body
+        assert "买车首付" in body
 
     def test_post_404_for_other_paths(self, dashboard_server):
         request = urllib.request.Request(dashboard_server + "/bad-action", data=b"", method="POST")

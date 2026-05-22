@@ -123,6 +123,33 @@ def test_mortgage_prepayment_estimates_interest_savings(db_path):
     assert "还款期数减少" in result.explanation
 
 
+def test_large_purchase_includes_monthly_expense_impact(db_path):
+    result = simulate_decision(
+        db_path,
+        "large_purchase",
+        1_200_000,
+        "2026-06",
+        payment_type="installment",
+        installment_months=6,
+        expected_expense_impact_cents=200_000,
+    )
+
+    assert "每月新增固定支出 2,000.00 元" in result.explanation
+
+
+def test_investment_reports_cash_reserve_and_upper_bound(db_path):
+    result = simulate_decision(
+        db_path,
+        "investment",
+        1_000_000,
+        "2026-06",
+    )
+
+    assert "必须保留现金" in result.explanation
+    assert "可投资现金上限" in result.explanation
+    assert result.suggested_max_amount_cents >= 0
+
+
 def test_cli_prints_stable_summary(db_path):
     completed = subprocess.run(
         [
