@@ -234,6 +234,52 @@ def test_import_beecount_uses_refresh_token_when_access_token_missing(db_path, m
     assert os.environ["BEECOUNT_REFRESH_TOKEN_TEST"] == "refresh-new"
 
 
+def test_import_beecount_prefers_read_api_token(db_path, monkeypatch):
+    payload = _load_payload()
+    calls = []
+
+    def fake_fetch(base_url, ledger_id, access_token, limit):
+        calls.append(access_token)
+        return payload
+
+    monkeypatch.setenv("BEECOUNT_READ_API_TOKEN_TEST", "read-pat")
+    monkeypatch.setenv("BEECOUNT_ACCESS_TOKEN_TEST", "access-old")
+    monkeypatch.setenv("BEECOUNT_REFRESH_TOKEN_TEST", "refresh-old")
+    monkeypatch.setattr(import_beecount_module, "_fetch_api_payload", fake_fetch)
+
+    summary = import_beecount(
+        db_path,
+        base_url="https://bee.example",
+        ledger_id="ledger_family_demo",
+        read_token_env="BEECOUNT_READ_API_TOKEN_TEST",
+        access_token_env="BEECOUNT_ACCESS_TOKEN_TEST",
+        refresh_token_env="BEECOUNT_REFRESH_TOKEN_TEST",
+    )
+
+    assert summary.imported == 3
+    assert calls == ["read-pat"]
+
+
+def test_import_beecount_reports_bad_read_api_token(db_path, monkeypatch):
+    import urllib.error
+
+    def fake_fetch(base_url, ledger_id, access_token, limit):
+        raise urllib.error.HTTPError("url", 403, "Forbidden", None, None)
+
+    monkeypatch.setenv("BEECOUNT_READ_API_TOKEN_TEST", "bad-read-pat")
+    monkeypatch.setattr(import_beecount_module, "_fetch_api_payload", fake_fetch)
+
+    with pytest.raises(RuntimeError, match="read:api PAT"):
+        import_beecount(
+            db_path,
+            base_url="https://bee.example",
+            ledger_id="ledger_family_demo",
+            read_token_env="BEECOUNT_READ_API_TOKEN_TEST",
+            access_token_env="BEECOUNT_ACCESS_TOKEN_TEST",
+            refresh_token_env="BEECOUNT_REFRESH_TOKEN_TEST",
+        )
+
+
 def test_import_beecount_refreshes_after_unauthorized(db_path, monkeypatch):
     import urllib.error
 

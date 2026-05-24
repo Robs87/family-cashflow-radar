@@ -23,6 +23,7 @@ from app.scripts.add_transaction import add_manual_transaction, parse_amount_cen
 from app.scripts.analyze_cashflow import analyze_cashflow
 from app.scripts.beecount_tokens import (
     DEFAULT_ACCESS_TOKEN_ENV,
+    DEFAULT_READ_TOKEN_ENV,
     DEFAULT_REFRESH_TOKEN_ENV,
     token_is_configured,
     write_beecount_config,
@@ -515,12 +516,15 @@ def _load_beecount_source_config(config_path: Path | None) -> dict:
         "beecount_input_json": resolved_input,
         "beecount_base_url": payload.get("base_url") or payload.get("baseUrl"),
         "beecount_ledger_id": payload.get("ledger_id") or payload.get("ledgerId"),
+        "beecount_read_token_env": payload.get("read_token_env")
+        or payload.get("readTokenEnv")
+        or DEFAULT_READ_TOKEN_ENV,
         "beecount_access_token_env": payload.get("access_token_env")
         or payload.get("accessTokenEnv")
-        or "BEECOUNT_ACCESS_TOKEN",
+        or DEFAULT_ACCESS_TOKEN_ENV,
         "beecount_refresh_token_env": payload.get("refresh_token_env")
         or payload.get("refreshTokenEnv")
-        or "BEECOUNT_REFRESH_TOKEN",
+        or DEFAULT_REFRESH_TOKEN_ENV,
         "beecount_limit": int(payload.get("limit") or 500),
     }
 
@@ -530,6 +534,7 @@ def _resolve_beecount_source(
     beecount_input_json: Path | None,
     beecount_base_url: str | None,
     beecount_ledger_id: str | None,
+    beecount_read_token_env: str,
     beecount_access_token_env: str,
     beecount_refresh_token_env: str,
     beecount_limit: int,
@@ -539,6 +544,7 @@ def _resolve_beecount_source(
             "beecount_input_json": beecount_input_json,
             "beecount_base_url": beecount_base_url,
             "beecount_ledger_id": beecount_ledger_id,
+            "beecount_read_token_env": beecount_read_token_env,
             "beecount_access_token_env": beecount_access_token_env,
             "beecount_refresh_token_env": beecount_refresh_token_env,
             "beecount_limit": beecount_limit,
@@ -549,6 +555,7 @@ def _resolve_beecount_source(
             "beecount_input_json": None,
             "beecount_base_url": None,
             "beecount_ledger_id": None,
+            "beecount_read_token_env": beecount_read_token_env,
             "beecount_access_token_env": beecount_access_token_env,
             "beecount_refresh_token_env": beecount_refresh_token_env,
             "beecount_limit": beecount_limit,
@@ -561,8 +568,10 @@ def save_beecount_token_config(
     base_url: str,
     ledger_id: str,
     limit_text: str,
+    read_token: str = "",
     access_token: str = "",
     refresh_token: str = "",
+    read_token_env: str = DEFAULT_READ_TOKEN_ENV,
     access_token_env: str = DEFAULT_ACCESS_TOKEN_ENV,
     refresh_token_env: str = DEFAULT_REFRESH_TOKEN_ENV,
 ) -> dict:
@@ -581,15 +590,17 @@ def save_beecount_token_config(
     if limit <= 0:
         return {"ok": False, "message": "读取上限必须大于 0"}
 
-    wrote_tokens = bool(access_token.strip() or refresh_token.strip())
+    wrote_tokens = bool(read_token.strip() or access_token.strip() or refresh_token.strip())
     try:
         write_beecount_config(
             config_path,
             base_url=base_url,
             ledger_id=ledger_id,
             limit=limit,
+            read_token=read_token,
             access_token=access_token,
             refresh_token=refresh_token,
+            read_token_env=read_token_env.strip() or DEFAULT_READ_TOKEN_ENV,
             access_token_env=access_token_env.strip() or DEFAULT_ACCESS_TOKEN_ENV,
             refresh_token_env=refresh_token_env.strip() or DEFAULT_REFRESH_TOKEN_ENV,
         )
@@ -674,6 +685,7 @@ def run_refresh_pipeline(
     beecount_input_json: Path | None = None,
     beecount_base_url: str | None = None,
     beecount_ledger_id: str | None = None,
+    beecount_read_token_env: str = DEFAULT_READ_TOKEN_ENV,
     beecount_access_token_env: str = "BEECOUNT_ACCESS_TOKEN",
     beecount_refresh_token_env: str = "BEECOUNT_REFRESH_TOKEN",
     beecount_limit: int = 500,
@@ -700,6 +712,7 @@ def run_refresh_pipeline(
         beecount_input_json,
         beecount_base_url,
         beecount_ledger_id,
+        beecount_read_token_env,
         beecount_access_token_env,
         beecount_refresh_token_env,
         beecount_limit,
@@ -717,6 +730,7 @@ def run_refresh_pipeline(
             beecount_source["beecount_input_json"],
             beecount_source["beecount_base_url"],
             beecount_source["beecount_ledger_id"],
+            beecount_source["beecount_read_token_env"],
             beecount_source["beecount_access_token_env"],
             beecount_source["beecount_refresh_token_env"],
             beecount_source["beecount_limit"],
@@ -775,6 +789,7 @@ def _handler_beecount_source(handler_cls: type) -> dict:
         handler_cls.beecount_input_json,
         handler_cls.beecount_base_url,
         handler_cls.beecount_ledger_id,
+        handler_cls.beecount_read_token_env,
         handler_cls.beecount_access_token_env,
         handler_cls.beecount_refresh_token_env,
         handler_cls.beecount_limit,
@@ -789,6 +804,7 @@ def _run_refresh_pipeline_for_handler(handler_cls: type) -> dict:
         beecount_input_json=handler_cls.beecount_input_json,
         beecount_base_url=handler_cls.beecount_base_url,
         beecount_ledger_id=handler_cls.beecount_ledger_id,
+        beecount_read_token_env=handler_cls.beecount_read_token_env,
         beecount_access_token_env=handler_cls.beecount_access_token_env,
         beecount_refresh_token_env=handler_cls.beecount_refresh_token_env,
         beecount_limit=handler_cls.beecount_limit,
@@ -1417,6 +1433,7 @@ def render_beecount_settings_html(
     beecount_input_json: Path | None = None,
     beecount_base_url: str | None = None,
     beecount_ledger_id: str | None = None,
+    beecount_read_token_env: str = DEFAULT_READ_TOKEN_ENV,
     beecount_access_token_env: str = DEFAULT_ACCESS_TOKEN_ENV,
     beecount_refresh_token_env: str = DEFAULT_REFRESH_TOKEN_ENV,
     beecount_limit: int = 500,
@@ -1427,16 +1444,19 @@ def render_beecount_settings_html(
         beecount_input_json,
         beecount_base_url,
         beecount_ledger_id,
+        beecount_read_token_env,
         beecount_access_token_env,
         beecount_refresh_token_env,
         beecount_limit,
     )
     base_url = source["beecount_base_url"] or DEFAULT_BEECOUNT_BASE_URL
     ledger_id = source["beecount_ledger_id"] or ""
+    read_env = source["beecount_read_token_env"] or DEFAULT_READ_TOKEN_ENV
     access_env = source["beecount_access_token_env"] or DEFAULT_ACCESS_TOKEN_ENV
     refresh_env = source["beecount_refresh_token_env"] or DEFAULT_REFRESH_TOKEN_ENV
     limit = source["beecount_limit"] or 500
     config_label = str(config_path) if config_path else "未配置"
+    read_status = _render_token_status("read:api token", token_is_configured(read_env))
     access_status = _render_token_status("access token", token_is_configured(access_env))
     refresh_status = _render_token_status("refresh token", token_is_configured(refresh_env))
     mapping_rows_html = _render_beecount_mapping_rows(_fetch_beecount_category_mappings(db_path))
@@ -1610,6 +1630,7 @@ def render_beecount_settings_html(
     {notice_html}
     <section class="panel">
       <div class="status-row">
+        {read_status}
         {access_status}
         {refresh_status}
       </div>
@@ -1623,11 +1644,17 @@ def render_beecount_settings_html(
         <label>读取上限
           <input name="limit" inputmode="numeric" value="{html.escape(str(limit))}" required>
         </label>
+        <label class="wide">Read API token 环境名
+          <input name="read_token_env" value="{html.escape(str(read_env))}" required>
+        </label>
         <label>Access token 环境名
           <input name="access_token_env" value="{html.escape(str(access_env))}" required>
         </label>
         <label>Refresh token 环境名
           <input name="refresh_token_env" value="{html.escape(str(refresh_env))}" required>
+        </label>
+        <label class="wide">新的 read:api token
+          <input type="password" name="read_token" autocomplete="off" placeholder="推荐：BeeCount PAT，scope 选择 read:api；留空则不覆盖 Keychain">
         </label>
         <label class="wide">新的 access_token
           <input type="password" name="access_token" autocomplete="off" placeholder="留空则不覆盖 Keychain 中已有值">
@@ -1635,7 +1662,7 @@ def render_beecount_settings_html(
         <label class="wide">新的 refresh_token
           <input type="password" name="refresh_token" autocomplete="off" placeholder="留空则不覆盖 Keychain 中已有值">
         </label>
-        <p class="hint">配置文件只保存连接参数：<code>{html.escape(config_label)}</code>。token 只写入 macOS Keychain，不写入仓库或 data 文件。</p>
+        <p class="hint">推荐使用 BeeCount 的长期 <code>read:api</code> PAT；access/refresh token 仅作为旧登录会话兜底。配置文件只保存连接参数：<code>{html.escape(config_label)}</code>。token 只写入 macOS Keychain，不写入仓库或 data 文件。</p>
         <button type="submit">保存 BeeCount 配置</button>
       </form>
     </section>
@@ -2992,6 +3019,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     beecount_input_json: Path | None = None
     beecount_base_url: str | None = None
     beecount_ledger_id: str | None = None
+    beecount_read_token_env = DEFAULT_READ_TOKEN_ENV
     beecount_access_token_env = "BEECOUNT_ACCESS_TOKEN"
     beecount_refresh_token_env = "BEECOUNT_REFRESH_TOKEN"
     beecount_limit = 500
@@ -3009,6 +3037,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 beecount_input_json=self.beecount_input_json,
                 beecount_base_url=self.beecount_base_url,
                 beecount_ledger_id=self.beecount_ledger_id,
+                beecount_read_token_env=self.beecount_read_token_env,
                 beecount_access_token_env=self.beecount_access_token_env,
                 beecount_refresh_token_env=self.beecount_refresh_token_env,
                 beecount_limit=self.beecount_limit,
@@ -3177,6 +3206,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 beecount_input_json=self.beecount_input_json,
                 beecount_base_url=self.beecount_base_url,
                 beecount_ledger_id=self.beecount_ledger_id,
+                beecount_read_token_env=self.beecount_read_token_env,
                 beecount_access_token_env=self.beecount_access_token_env,
                 beecount_refresh_token_env=self.beecount_refresh_token_env,
                 beecount_limit=self.beecount_limit,
@@ -3191,6 +3221,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 beecount_input_json=self.beecount_input_json,
                 beecount_base_url=self.beecount_base_url,
                 beecount_ledger_id=self.beecount_ledger_id,
+                beecount_read_token_env=self.beecount_read_token_env,
                 beecount_access_token_env=self.beecount_access_token_env,
                 beecount_refresh_token_env=self.beecount_refresh_token_env,
                 beecount_limit=self.beecount_limit,
@@ -3402,8 +3433,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             fields.get("base_url", [""])[0],
             fields.get("ledger_id", [""])[0],
             fields.get("limit", ["500"])[0],
+            read_token=fields.get("read_token", [""])[0],
             access_token=fields.get("access_token", [""])[0],
             refresh_token=fields.get("refresh_token", [""])[0],
+            read_token_env=fields.get("read_token_env", [DEFAULT_READ_TOKEN_ENV])[0],
             access_token_env=fields.get("access_token_env", [DEFAULT_ACCESS_TOKEN_ENV])[0],
             refresh_token_env=fields.get("refresh_token_env", [DEFAULT_REFRESH_TOKEN_ENV])[0],
         )
@@ -3435,6 +3468,7 @@ def run_server(
     beecount_input_json: Path | None = None,
     beecount_base_url: str | None = None,
     beecount_ledger_id: str | None = None,
+    beecount_read_token_env: str = DEFAULT_READ_TOKEN_ENV,
     beecount_access_token_env: str = "BEECOUNT_ACCESS_TOKEN",
     beecount_refresh_token_env: str = "BEECOUNT_REFRESH_TOKEN",
     beecount_limit: int = 500,
@@ -3446,6 +3480,7 @@ def run_server(
     DashboardHandler.beecount_input_json = beecount_input_json
     DashboardHandler.beecount_base_url = beecount_base_url
     DashboardHandler.beecount_ledger_id = beecount_ledger_id
+    DashboardHandler.beecount_read_token_env = beecount_read_token_env
     DashboardHandler.beecount_access_token_env = beecount_access_token_env
     DashboardHandler.beecount_refresh_token_env = beecount_refresh_token_env
     DashboardHandler.beecount_limit = beecount_limit
@@ -3458,6 +3493,7 @@ def run_server(
         beecount_input_json,
         beecount_base_url,
         beecount_ledger_id,
+        beecount_read_token_env,
         beecount_access_token_env,
         beecount_refresh_token_env,
         beecount_limit,
@@ -3497,6 +3533,7 @@ def main() -> None:
     parser.add_argument("--beecount-input-json", help="BeeCount transactions/items JSON 文件")
     parser.add_argument("--beecount-base-url", default=str(DEFAULT_BEECOUNT_BASE_URL), help="BeeCount Cloud read API base URL")
     parser.add_argument("--beecount-ledger-id", default="", help="BeeCount ledger id / external id")
+    parser.add_argument("--beecount-read-token-env", default=DEFAULT_READ_TOKEN_ENV, help="BeeCount read:api PAT 环境变量名")
     parser.add_argument("--beecount-access-token-env", default="BEECOUNT_ACCESS_TOKEN", help="BeeCount access token 环境变量名")
     parser.add_argument("--beecount-refresh-token-env", default="BEECOUNT_REFRESH_TOKEN", help="BeeCount refresh token 环境变量名")
     parser.add_argument("--beecount-limit", type=int, default=500, help="BeeCount read API 单次读取上限")
@@ -3519,6 +3556,7 @@ def main() -> None:
         beecount_input_json=Path(args.beecount_input_json) if args.beecount_input_json else None,
         beecount_base_url=args.beecount_base_url or None,
         beecount_ledger_id=args.beecount_ledger_id or None,
+        beecount_read_token_env=args.beecount_read_token_env,
         beecount_access_token_env=args.beecount_access_token_env,
         beecount_refresh_token_env=args.beecount_refresh_token_env,
         beecount_limit=args.beecount_limit,

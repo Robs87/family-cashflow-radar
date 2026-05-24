@@ -379,10 +379,22 @@ def _fetch_api_payload(base_url: str, ledger_id: str, access_token: str, limit: 
 def _fetch_api_payload_with_refresh(
     base_url: str,
     ledger_id: str,
+    read_token_env: str,
     access_token_env: str,
     refresh_token_env: str,
     limit: int,
 ) -> Any:
+    read_token = get_token(read_token_env)
+    if read_token.value:
+        try:
+            return _fetch_api_payload(base_url, ledger_id, read_token.value, limit)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise RuntimeError(
+                    f"BeeCount read API token 无效或权限不足；请在 BeeCount 创建 read:api PAT 并更新 {read_token_env}"
+                ) from exc
+            raise
+
     access_token = get_token(access_token_env)
     refresh_token = get_token(refresh_token_env)
 
@@ -395,7 +407,9 @@ def _fetch_api_payload_with_refresh(
                 raise
             refresh_attempted = True
     elif not refresh_token.value:
-        raise RuntimeError(f"环境变量 {access_token_env} 未设置，且 {refresh_token_env} 未设置")
+        raise RuntimeError(
+            f"环境变量 {read_token_env} 未设置，且 {access_token_env} / {refresh_token_env} 未设置"
+        )
 
     try:
         refreshed = _refresh_access_token(base_url, refresh_token.value)
@@ -419,6 +433,7 @@ def import_beecount(
     input_json: Path | None = None,
     base_url: str | None = None,
     ledger_id: str | None = None,
+    read_token_env: str = "BEECOUNT_READ_API_TOKEN",
     access_token_env: str = "BEECOUNT_ACCESS_TOKEN",
     refresh_token_env: str = "BEECOUNT_REFRESH_TOKEN",
     limit: int = 500,
@@ -432,6 +447,7 @@ def import_beecount(
         payload = _fetch_api_payload_with_refresh(
             base_url,
             ledger_id,
+            read_token_env,
             access_token_env,
             refresh_token_env,
             limit,
@@ -457,9 +473,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url", help="BeeCount Cloud base URL，例如 https://bee.332626.xyz:9090")
     parser.add_argument("--ledger-id", help="BeeCount ledger id / external id")
     parser.add_argument(
+        "--read-token-env",
+        default="BEECOUNT_READ_API_TOKEN",
+        help="读取 BeeCount 长期只读 read:api PAT 的环境变量名；优先于 access/refresh token",
+    )
+    parser.add_argument(
         "--access-token-env",
         default="BEECOUNT_ACCESS_TOKEN",
-        help="读取 BeeCount 普通 access token 的环境变量名；MCP PAT 不能调用 /api/v1/read/*",
+        help="读取 BeeCount 普通 access token 的环境变量名；仅作为旧登录 token 兜底",
     )
     parser.add_argument(
         "--refresh-token-env",
@@ -477,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
             input_json=Path(args.input_json) if args.input_json else None,
             base_url=args.base_url,
             ledger_id=args.ledger_id,
+            read_token_env=args.read_token_env,
             access_token_env=args.access_token_env,
             refresh_token_env=args.refresh_token_env,
             limit=args.limit,

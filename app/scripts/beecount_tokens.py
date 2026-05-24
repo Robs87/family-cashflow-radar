@@ -16,6 +16,7 @@ from typing import Literal
 
 
 KEYCHAIN_SERVICE = "family-cashflow-radar.beecount"
+DEFAULT_READ_TOKEN_ENV = "BEECOUNT_READ_API_TOKEN"
 DEFAULT_ACCESS_TOKEN_ENV = "BEECOUNT_ACCESS_TOKEN"
 DEFAULT_REFRESH_TOKEN_ENV = "BEECOUNT_REFRESH_TOKEN"
 
@@ -103,11 +104,15 @@ def write_beecount_config(
     base_url: str,
     ledger_id: str,
     limit: int,
+    read_token: str = "",
     access_token: str = "",
     refresh_token: str = "",
+    read_token_env: str = DEFAULT_READ_TOKEN_ENV,
     access_token_env: str = DEFAULT_ACCESS_TOKEN_ENV,
     refresh_token_env: str = DEFAULT_REFRESH_TOKEN_ENV,
 ) -> None:
+    if read_token.strip():
+        write_keychain_token(read_token_env, read_token)
     if access_token.strip():
         write_keychain_token(access_token_env, access_token)
     if refresh_token.strip():
@@ -117,6 +122,7 @@ def write_beecount_config(
     payload = {
         "base_url": base_url.strip(),
         "ledger_id": ledger_id.strip(),
+        "read_token_env": read_token_env.strip() or DEFAULT_READ_TOKEN_ENV,
         "access_token_env": access_token_env.strip() or DEFAULT_ACCESS_TOKEN_ENV,
         "refresh_token_env": refresh_token_env.strip() or DEFAULT_REFRESH_TOKEN_ENV,
         "limit": int(limit),

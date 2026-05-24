@@ -249,6 +249,7 @@ class TestRenderDashboard:
             "https://bee.example/",
             "ledger-1",
             "200",
+            read_token="read-secret",
             access_token="access-secret",
             refresh_token="refresh-secret",
         )
@@ -261,8 +262,10 @@ class TestRenderDashboard:
                     "base_url": "https://bee.example",
                     "ledger_id": "ledger-1",
                     "limit": 200,
+                    "read_token": "read-secret",
                     "access_token": "access-secret",
                     "refresh_token": "refresh-secret",
+                    "read_token_env": "BEECOUNT_READ_API_TOKEN",
                     "access_token_env": "BEECOUNT_ACCESS_TOKEN",
                     "refresh_token_env": "BEECOUNT_REFRESH_TOKEN",
                 },
@@ -279,6 +282,7 @@ class TestRenderDashboard:
         config_path = tmp_path / "beecount_source.json"
 
         def fake_write(config_path_arg, **kwargs):
+            assert kwargs["read_token"] == ""
             assert kwargs["access_token"] == ""
             assert kwargs["refresh_token"] == ""
             config_path_arg.write_text(json.dumps({"base_url": kwargs["base_url"]}), encoding="utf-8")
@@ -541,6 +545,7 @@ class TestRefreshPipeline:
                 {
                     "base_url": "https://bee.332626.xyz:9090",
                     "ledger_id": "1",
+                    "read_token_env": "BEECOUNT_READ_API_TOKEN",
                     "access_token_env": "BEECOUNT_ACCESS_TOKEN",
                     "refresh_token_env": "BEECOUNT_REFRESH_TOKEN",
                     "limit": 200,
@@ -554,6 +559,7 @@ class TestRefreshPipeline:
             beecount_input_json=None,
             beecount_base_url=None,
             beecount_ledger_id=None,
+            beecount_read_token_env="IGNORED_WHEN_CONFIG_EXISTS",
             beecount_access_token_env="IGNORED_WHEN_CONFIG_EXISTS",
             beecount_refresh_token_env="IGNORED_WHEN_CONFIG_EXISTS",
             beecount_limit=500,
@@ -563,6 +569,7 @@ class TestRefreshPipeline:
             "beecount_input_json": None,
             "beecount_base_url": "https://bee.332626.xyz:9090",
             "beecount_ledger_id": "1",
+            "beecount_read_token_env": "BEECOUNT_READ_API_TOKEN",
             "beecount_access_token_env": "BEECOUNT_ACCESS_TOKEN",
             "beecount_refresh_token_env": "BEECOUNT_REFRESH_TOKEN",
             "beecount_limit": 200,
@@ -589,8 +596,10 @@ class TestRefreshPipeline:
 
         assert result["ok"] is False
         assert result["steps"][0]["label"] == "同步 BeeCount"
-        assert "BEECOUNT_ACCESS_TOKEN_MISSING_FOR_TEST 未设置" in result["steps"][0]["stderr"]
-        assert "BEECOUNT_REFRESH_TOKEN_MISSING_FOR_TEST 未设置" in result["steps"][0]["stderr"]
+        assert "BEECOUNT_READ_API_TOKEN 未设置" in result["steps"][0]["stderr"]
+        assert "BEECOUNT_ACCESS_TOKEN_MISSING_FOR_TEST / BEECOUNT_REFRESH_TOKEN_MISSING_FOR_TEST 未设置" in result[
+            "steps"
+        ][0]["stderr"]
 
     def test_refresh_pipeline_stops_on_import_failure(self, db_path, tmp_path):
         missing_input = tmp_path / "missing"

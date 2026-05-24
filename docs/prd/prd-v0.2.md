@@ -63,7 +63,7 @@ BeeCount / BeeCount Cloud 是默认流水记录层。本项目不再把日常记
 可选接入路径：
 
 1. BeeCount Cloud MCP read tools：适合先验证账本可读性和字段语义。
-2. BeeCount Cloud read API：适合后续稳定同步服务，需要普通 access token；`bcmcp_...` PAT 只能访问 MCP endpoint。
+2. BeeCount Cloud read API：适合稳定后台同步服务，优先使用带 `read:api` scope 的长期 PAT；普通 Web/App access token 仅作为旧兜底。
 3. BeeCount Cloud SQLite / 加密备份解包后的离线数据库：适合本地批量分析。
 
 ### 4.2 历史 CSV 迁移
