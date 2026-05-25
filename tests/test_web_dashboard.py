@@ -583,12 +583,14 @@ class TestRefreshPipeline:
                 {
                     "base_url": "https://bee.332626.xyz:9090",
                     "ledger_id": "1",
+                    "read_token_env": "BEECOUNT_READ_API_TOKEN_MISSING_FOR_TEST",
                     "access_token_env": "BEECOUNT_ACCESS_TOKEN_MISSING_FOR_TEST",
                     "refresh_token_env": "BEECOUNT_REFRESH_TOKEN_MISSING_FOR_TEST",
                 }
             ),
             encoding="utf-8",
         )
+        monkeypatch.delenv("BEECOUNT_READ_API_TOKEN_MISSING_FOR_TEST", raising=False)
         monkeypatch.delenv("BEECOUNT_ACCESS_TOKEN_MISSING_FOR_TEST", raising=False)
         monkeypatch.delenv("BEECOUNT_REFRESH_TOKEN_MISSING_FOR_TEST", raising=False)
 
@@ -596,7 +598,7 @@ class TestRefreshPipeline:
 
         assert result["ok"] is False
         assert result["steps"][0]["label"] == "同步 BeeCount"
-        assert "BEECOUNT_READ_API_TOKEN 未设置" in result["steps"][0]["stderr"]
+        assert "BEECOUNT_READ_API_TOKEN_MISSING_FOR_TEST 未设置" in result["steps"][0]["stderr"]
         assert "BEECOUNT_ACCESS_TOKEN_MISSING_FOR_TEST / BEECOUNT_REFRESH_TOKEN_MISSING_FOR_TEST 未设置" in result[
             "steps"
         ][0]["stderr"]
@@ -1077,7 +1079,12 @@ class TestHttpHandler:
         TestHandler = type(
             "TestHandler",
             (DashboardHandler,),
-            {"db_path": db_path, "raw_input_path": FIXTURES_DIR, "beecount_config_path": None},
+            {
+                "db_path": db_path,
+                "raw_input_path": FIXTURES_DIR,
+                "beecount_config_path": None,
+                "auto_sync_state": _new_auto_sync_state(True, True, 60),
+            },
         )
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
@@ -1100,6 +1107,8 @@ class TestHttpHandler:
         assert "刷新完成" in body
         assert "本月稳定收入" in body
         assert "20,000.00 元" in body
+        assert TestHandler.auto_sync_state["last_ok"] is True
+        assert "同步完成" in TestHandler.auto_sync_state["last_message"]
 
     def test_post_refresh_runs_beecount_pipeline_when_configured(self, db_path):
         TestHandler = type(

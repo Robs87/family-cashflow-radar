@@ -811,6 +811,25 @@ def _run_refresh_pipeline_for_handler(handler_cls: type) -> dict:
     )
 
 
+def _record_refresh_result_in_auto_sync_state(handler_cls: type, result: dict) -> None:
+    state = getattr(handler_cls, "auto_sync_state", None)
+    if not state:
+        return
+    ok = bool(result.get("ok"))
+    state["run_count"] = int(state.get("run_count") or 0) + 1
+    if not ok:
+        state["failure_count"] = int(state.get("failure_count") or 0) + 1
+    state.update(
+        {
+            "running": False,
+            "last_started_at": state.get("last_started_at") or _iso_timestamp(),
+            "last_finished_at": _iso_timestamp(),
+            "last_ok": ok,
+            "last_message": _pipeline_result_message(result),
+        }
+    )
+
+
 def _run_auto_sync_once(handler_cls: type) -> dict:
     state = getattr(handler_cls, "auto_sync_state", None)
     if state is None:
@@ -3084,6 +3103,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/actions/refresh":
             with self.sync_lock:
                 result = _run_refresh_pipeline_for_handler(type(self))
+                _record_refresh_result_in_auto_sync_state(type(self), result)
             try:
                 body = render_dashboard_html(
                     self.db_path,

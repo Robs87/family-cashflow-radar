@@ -224,6 +224,7 @@ def test_import_beecount_uses_refresh_token_when_access_token_missing(db_path, m
         db_path,
         base_url="https://bee.example",
         ledger_id="ledger_family_demo",
+        read_token_env="BEECOUNT_READ_API_TOKEN_MISSING_FOR_TEST",
         access_token_env="BEECOUNT_ACCESS_TOKEN_TEST",
         refresh_token_env="BEECOUNT_REFRESH_TOKEN_TEST",
     )
@@ -308,6 +309,7 @@ def test_import_beecount_refreshes_after_unauthorized(db_path, monkeypatch):
         db_path,
         base_url="https://bee.example",
         ledger_id="ledger_family_demo",
+        read_token_env="BEECOUNT_READ_API_TOKEN_MISSING_FOR_TEST",
         access_token_env="BEECOUNT_ACCESS_TOKEN_TEST",
         refresh_token_env="BEECOUNT_REFRESH_TOKEN_TEST",
     )
@@ -335,6 +337,7 @@ def test_import_beecount_reports_rotated_refresh_token(db_path, monkeypatch):
             db_path,
             base_url="https://bee.example",
             ledger_id="ledger_family_demo",
+            read_token_env="BEECOUNT_READ_API_TOKEN_MISSING_FOR_TEST",
             access_token_env="BEECOUNT_ACCESS_TOKEN_TEST",
             refresh_token_env="BEECOUNT_REFRESH_TOKEN_TEST",
         )
