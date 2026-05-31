@@ -470,7 +470,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="同步 BeeCount Cloud 流水到 raw_transactions")
     parser.add_argument("--db", default="data/processed/cashflow.db")
     parser.add_argument("--input-json", help="BeeCount transactions/items JSON 文件")
-    parser.add_argument("--base-url", help="BeeCount Cloud base URL，例如 https://bee.332626.xyz:9090")
+    parser.add_argument("--base-url", help="BeeCount Cloud base URL，例如 https://beecount.example.com")
     parser.add_argument("--ledger-id", help="BeeCount ledger id / external id")
     parser.add_argument(
         "--read-token-env",

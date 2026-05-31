@@ -543,7 +543,7 @@ class TestRefreshPipeline:
         config_path.write_text(
             json.dumps(
                 {
-                    "base_url": "https://bee.332626.xyz:9090",
+                    "base_url": "https://beecount.example.com",
                     "ledger_id": "1",
                     "read_token_env": "BEECOUNT_READ_API_TOKEN",
                     "access_token_env": "BEECOUNT_ACCESS_TOKEN",
@@ -567,7 +567,7 @@ class TestRefreshPipeline:
 
         assert source == {
             "beecount_input_json": None,
-            "beecount_base_url": "https://bee.332626.xyz:9090",
+            "beecount_base_url": "https://beecount.example.com",
             "beecount_ledger_id": "1",
             "beecount_read_token_env": "BEECOUNT_READ_API_TOKEN",
             "beecount_access_token_env": "BEECOUNT_ACCESS_TOKEN",
@@ -581,7 +581,7 @@ class TestRefreshPipeline:
         config_path.write_text(
             json.dumps(
                 {
-                    "base_url": "https://bee.332626.xyz:9090",
+                    "base_url": "https://beecount.example.com",
                     "ledger_id": "1",
                     "read_token_env": "BEECOUNT_READ_API_TOKEN_MISSING_FOR_TEST",
                     "access_token_env": "BEECOUNT_ACCESS_TOKEN_MISSING_FOR_TEST",

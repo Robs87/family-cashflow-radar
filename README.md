@@ -34,7 +34,7 @@ BeeCount Cloud 当前可作为数据源的候选路径：
 当前 BeeCount Cloud NAS 地址：
 
 ```text
-https://bee.332626.xyz:9090
+https://beecount.example.com
 ```
 
 ## 日常使用
@@ -54,7 +54,7 @@ export BEECOUNT_ACCESS_TOKEN=...
 export BEECOUNT_REFRESH_TOKEN=...
 python3 app/main.py \
   --db data/processed/cashflow.db \
-  --beecount-base-url https://bee.332626.xyz:9090 \
+  --beecount-base-url https://beecount.example.com \
   --beecount-ledger-id <ledger-id>
 ```
 
@@ -62,7 +62,7 @@ python3 app/main.py \
 
 ```json
 {
-  "base_url": "https://bee.332626.xyz:9090",
+  "base_url": "https://beecount.example.com",
   "ledger_id": "1",
   "access_token_env": "BEECOUNT_ACCESS_TOKEN",
   "refresh_token_env": "BEECOUNT_REFRESH_TOKEN",

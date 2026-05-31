@@ -72,7 +72,7 @@ from app.scripts.simulate_decision import (
 DEFAULT_DB = Path("data/processed/cashflow.db")
 DEFAULT_RAW_INPUT = Path("data/raw")
 DEFAULT_BEECOUNT_CONFIG = Path("data/processed/beecount_source.json")
-DEFAULT_BEECOUNT_BASE_URL = "https://bee.332626.xyz:9090"
+DEFAULT_BEECOUNT_BASE_URL = "https://beecount.example.com"
 DEFAULT_AUTO_SYNC_INTERVAL_MINUTES = 60.0
 SCHEMA_SQL = Path(__file__).resolve().parent / "db" / "schema.sql"
 SEED_RULES_SQL = Path(__file__).resolve().parent / "db" / "seed_rules.sql"
